@@ -1,0 +1,33 @@
+[package]
+name = "archivum"
+version = "0.1.0"
+description = "A digital archive for preserving books, papers, and documents"
+authors = ["trey"]
+edition = "2021"
+
+[lib]
+name = "archivum_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+walkdir = "2"
+mime_guess = "2"
+thiserror = "2"
+pdf-extract = "0.10.0"
