@@ -156,6 +156,34 @@ fn extract_attr(tag: &str, attr: &str) -> Option<String> {
     Some(tag[start..end].to_string())
 }
 
+/// Extract text from a MOBI file (content is HTML internally)
+fn extract_mobi_text(path: &Path) -> Result<String, String> {
+    let mobi =
+        mobi::Mobi::from_path(path).map_err(|e| format!("Failed to parse MOBI: {}", e))?;
+    let html = mobi.content_as_string_lossy();
+    html2text::from_read(html.as_bytes(), 120)
+        .map_err(|e| format!("Failed to convert MOBI HTML to text: {}", e))
+}
+
+/// Extract text from a DjVu file using djvutxt (if installed)
+fn extract_djvu_text(path: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("djvutxt")
+        .arg(path)
+        .output()
+        .map_err(|_| "DjVu text extraction requires djvutxt (brew install djvulibre)".to_string())?;
+
+    if !output.status.success() {
+        return Err("djvutxt failed — file may not have a text layer".to_string());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    if text.trim().is_empty() {
+        Err("DjVu file has no text layer".to_string())
+    } else {
+        Ok(text)
+    }
+}
+
 /// Extract text from an HTML file
 fn extract_html_text(path: &Path) -> Result<String, String> {
     let html = std::fs::read(path).map_err(|e| format!("Failed to read HTML: {}", e))?;
@@ -173,9 +201,11 @@ fn extract_local_text(path: &Path, format: &str) -> Result<String, String> {
     match format {
         "pdf" => extract_pdf_text(path),
         "epub" => extract_epub_text(path),
+        "mobi" => extract_mobi_text(path),
+        "djvu" => extract_djvu_text(path),
         "html" | "htm" => extract_html_text(path),
         "txt" | "md" => extract_text_content(path),
-        // MOBI, DjVu, CBZ/CBR — no local extractor, Claude-only
+        // CBZ/CBR are image-only — Claude vision or store as-is
         _ => Err(format!("No local text extractor for .{} files", format)),
     }
 }
