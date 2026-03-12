@@ -76,6 +76,36 @@ struct ResponseContent {
     text: Option<String>,
 }
 
+const METADATA_PROMPT: &str = r#"You are a document metadata extractor. Based on the text excerpt below, return a JSON object with these fields:
+
+{
+  "title": "The document's title",
+  "author": "The author(s)",
+  "description": "A 1-3 sentence summary",
+  "language": "ISO 639-1 language code (e.g. 'en')",
+  "isbn": "ISBN if found, null otherwise",
+  "publisher": "Publisher if found, null otherwise",
+  "published_date": "Publication date if found, null otherwise",
+  "page_count": null,
+  "tags": ["relevant", "topic", "tags"]
+}
+
+Return ONLY the JSON object, no other text."#;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataResult {
+    pub title: String,
+    pub author: String,
+    pub description: Option<String>,
+    pub language: Option<String>,
+    pub isbn: Option<String>,
+    pub publisher: Option<String>,
+    pub published_date: Option<String>,
+    pub page_count: Option<i32>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 const EXTRACTION_PROMPT: &str = r#"You are a document metadata extractor and content converter. Analyze this document and return a JSON object with these fields:
 
 {
@@ -381,5 +411,80 @@ impl ClaudeClient {
                 &text[..text.len().min(500)]
             ));
         }
+    }
+
+    /// Enrich metadata by sending a small text excerpt to Claude.
+    /// Much cheaper and faster than sending the full document.
+    pub async fn enrich_metadata(
+        &self,
+        text_excerpt: &str,
+        api_key: &str,
+        model: &str,
+    ) -> Result<MetadataResult, String> {
+        if api_key.is_empty() {
+            return Err("No API key configured".to_string());
+        }
+
+        // Send just the first ~4000 chars — enough for metadata detection
+        let excerpt = if text_excerpt.len() > 4000 {
+            &text_excerpt[..4000]
+        } else {
+            text_excerpt
+        };
+
+        let request = ApiRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: format!(
+                        "Here is an excerpt from a document:\n\n---\n{}\n---\n\n{}",
+                        excerpt, METADATA_PROMPT
+                    ),
+                }],
+            }],
+        };
+
+        let response = self
+            .client
+            .post(CLAUDE_API_URL)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format!("API request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Claude API error ({}): {}", status, body));
+        }
+
+        let api_response: ApiResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse API response: {}", e))?;
+
+        let text = api_response
+            .content
+            .into_iter()
+            .find_map(|c| c.text)
+            .ok_or_else(|| "No text in API response".to_string())?;
+
+        let json_str = text
+            .trim()
+            .strip_prefix("```json")
+            .unwrap_or(text.trim())
+            .strip_prefix("```")
+            .unwrap_or(text.trim())
+            .strip_suffix("```")
+            .unwrap_or(text.trim())
+            .trim();
+
+        serde_json::from_str::<MetadataResult>(json_str)
+            .map_err(|e| format!("Failed to parse metadata: {}", e))
     }
 }

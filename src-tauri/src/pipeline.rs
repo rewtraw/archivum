@@ -296,13 +296,63 @@ pub async fn import_file(
 
     let fallback_title = title_from_filename(source_path);
 
-    // 7. Try Claude enrichment if API key is configured
+    // 7. Determine Claude strategy based on what we have
     let (api_key, model) = {
         let cfg = config.lock().unwrap().load();
         (cfg.anthropic_api_key.unwrap_or_default(), cfg.model)
     };
+    let has_api_key = !api_key.is_empty();
+    let has_local_text = local_text.as_ref().is_ok_and(|t| !t.trim().is_empty());
 
-    if !api_key.is_empty() {
+    if has_local_text {
+        // Local extraction succeeded — use local content, enrich metadata with Claude
+        let content = local_text.unwrap();
+
+        if has_api_key {
+            {
+                let db_lock = db.lock().unwrap();
+                db_lock
+                    .update_task(
+                        task_id,
+                        "running",
+                        0.6,
+                        Some("Enriching metadata with Claude..."),
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+
+            match claude
+                .enrich_metadata(&content, &api_key, &model)
+                .await
+            {
+                Ok(meta) => {
+                    return finish_import(
+                        db, storage, task_id, doc_id,
+                        &meta.title, &meta.author,
+                        meta.description.as_deref(), meta.language.as_deref(),
+                        meta.isbn.as_deref(), meta.publisher.as_deref(),
+                        meta.published_date.as_deref(), meta.page_count,
+                        &content, &meta.tags, None,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[pipeline] metadata enrichment failed: {}", e);
+                    // Fall through — use local text with filename as title
+                }
+            }
+        }
+
+        return finish_import(
+            db, storage, task_id, doc_id,
+            &fallback_title, "Unknown",
+            None, None, None, None, None, None,
+            &content, &[], None,
+        );
+    }
+
+    // 8. No local text — try full Claude extraction (for image-based formats like CBZ/CBR)
+    if has_api_key {
         {
             let db_lock = db.lock().unwrap();
             db_lock
@@ -322,84 +372,32 @@ pub async fn import_file(
         {
             Ok(result) => {
                 return finish_import(
-                    db,
-                    storage,
-                    task_id,
-                    doc_id,
-                    &result.title,
-                    &result.author,
-                    result.description.as_deref(),
-                    result.language.as_deref(),
-                    result.isbn.as_deref(),
-                    result.publisher.as_deref(),
-                    result.published_date.as_deref(),
-                    result.page_count,
-                    &result.markdown_content,
-                    &result.tags,
-                    None,
+                    db, storage, task_id, doc_id,
+                    &result.title, &result.author,
+                    result.description.as_deref(), result.language.as_deref(),
+                    result.isbn.as_deref(), result.publisher.as_deref(),
+                    result.published_date.as_deref(), result.page_count,
+                    &result.markdown_content, &result.tags, None,
                 );
             }
             Err(e) => {
-                eprintln!("[pipeline] Claude extraction failed, using local text: {}", e);
-                // Fall through to local-only path
+                eprintln!("[pipeline] Claude extraction failed: {}", e);
             }
         }
     }
 
-    // 8. Local-only import (no Claude or Claude failed)
-    let content = local_text.unwrap_or_default();
-    if content.is_empty() {
-        // Store the document but mark it as needing processing
-        let db_lock = db.lock().unwrap();
-        db_lock
-            .update_document_metadata(
-                doc_id,
-                &fallback_title,
-                "Unknown",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                "complete",
-            )
-            .map_err(|e| e.to_string())?;
-        db_lock
-            .update_task(
-                task_id,
-                "complete",
-                1.0,
-                Some("Imported (no text extracted)"),
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-        return Ok(doc_id.to_string());
-    }
-
-    finish_import(
-        db,
-        storage,
-        task_id,
-        doc_id,
-        &fallback_title,
-        "Unknown",
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &content,
-        &[],
-        if api_key.is_empty() {
-            None
-        } else {
-            Some("Claude unavailable — imported with local text extraction")
-        },
-    )
+    // 9. Nothing worked — store with filename only
+    let db_lock = db.lock().unwrap();
+    db_lock
+        .update_document_metadata(
+            doc_id, &fallback_title, "Unknown",
+            None, None, None, None, None, None, None, None, "complete",
+        )
+        .map_err(|e| e.to_string())?;
+    db_lock
+        .update_task(task_id, "complete", 1.0, Some("Imported (no text extracted)"), None)
+        .map_err(|e| e.to_string())?;
+    Ok(doc_id.to_string())
 }
 
 fn finish_import(
