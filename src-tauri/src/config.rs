@@ -8,6 +8,30 @@ pub struct AppConfig {
     pub anthropic_api_key: Option<String>,
     #[serde(default = "default_model")]
     pub model: String,
+    #[serde(default)]
+    pub cloudflare_account_id: Option<String>,
+    #[serde(default)]
+    pub cloudflare_api_token: Option<String>,
+    #[serde(default)]
+    pub selected_whisper_model: Option<String>,
+    #[serde(default = "default_ai_provider")]
+    pub ai_provider: String,
+    #[serde(default = "default_ollama_model")]
+    pub ollama_model: String,
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
+}
+
+fn default_ai_provider() -> String {
+    "claude".to_string()
+}
+
+fn default_ollama_model() -> String {
+    String::new()
+}
+
+fn default_ollama_base_url() -> String {
+    "http://localhost:11434".to_string()
 }
 
 fn default_model() -> String {
@@ -19,6 +43,12 @@ impl Default for AppConfig {
         Self {
             anthropic_api_key: None,
             model: default_model(),
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            selected_whisper_model: None,
+            ai_provider: default_ai_provider(),
+            ollama_model: default_ollama_model(),
+            ollama_base_url: default_ollama_base_url(),
         }
     }
 }

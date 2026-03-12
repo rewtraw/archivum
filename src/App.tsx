@@ -1,13 +1,39 @@
-import { Routes, Route } from "react-router-dom";
+import { useState, useEffect, useCallback } from "react";
+import { Routes, Route, useNavigate } from "react-router-dom";
 import { css } from "../styled-system/css";
 import { Sidebar } from "./components/Sidebar";
 import { Library } from "./pages/Library";
-import { Import } from "./pages/Import";
 import { DocumentView } from "./pages/DocumentView";
 import { Search } from "./pages/Search";
 import { Settings } from "./pages/Settings";
+import { Chat } from "./pages/Chat";
+import { QuickSearch } from "./components/QuickSearch";
 
 function App() {
+  const [quickSearchOpen, setQuickSearchOpen] = useState(false);
+  const navigate = useNavigate();
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      // Cmd+K: Quick search
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setQuickSearchOpen((open) => !open);
+      }
+      // Cmd+I: Import
+      if ((e.metaKey || e.ctrlKey) && e.key === "i") {
+        e.preventDefault();
+        navigate("/?import=true");
+      }
+    },
+    [navigate]
+  );
+
+  useEffect(() => {
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [handleKeyDown]);
+
   return (
     <div
       className={css({
@@ -28,12 +54,16 @@ function App() {
       >
         <Routes>
           <Route path="/" element={<Library />} />
-          <Route path="/import" element={<Import />} />
           <Route path="/search" element={<Search />} />
           <Route path="/document/:id" element={<DocumentView />} />
+          <Route path="/chat" element={<Chat />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>
+      <QuickSearch
+        open={quickSearchOpen}
+        onClose={() => setQuickSearchOpen(false)}
+      />
     </div>
   );
 }

@@ -2,20 +2,22 @@ import { useState, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { css } from "../../styled-system/css";
 import { motion, AnimatePresence } from "framer-motion";
-import { searchDocuments } from "../lib/api";
+import { searchDocuments, searchSemantic } from "../lib/api";
 import type { SearchResult } from "../lib/api";
+
+type SearchMode = "keyword" | "semantic";
 
 export function Search() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searched, setSearched] = useState(false);
   const [searching, setSearching] = useState(false);
+  const [mode, setMode] = useState<SearchMode>("keyword");
   const navigate = useNavigate();
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
-  const handleSearch = useCallback(
-    (value: string) => {
-      setQuery(value);
+  const doSearch = useCallback(
+    (value: string, searchMode: SearchMode) => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
 
       if (value.trim().length < 2) {
@@ -24,10 +26,15 @@ export function Search() {
         return;
       }
 
+      const delay = searchMode === "semantic" ? 500 : 250;
+
       debounceRef.current = setTimeout(async () => {
         setSearching(true);
         try {
-          const res = await searchDocuments(value.trim());
+          const res =
+            searchMode === "semantic"
+              ? await searchSemantic(value.trim())
+              : await searchDocuments(value.trim());
           setResults(res);
           setSearched(true);
         } catch (e) {
@@ -35,9 +42,27 @@ export function Search() {
         } finally {
           setSearching(false);
         }
-      }, 250);
+      }, delay);
     },
     []
+  );
+
+  const handleSearch = useCallback(
+    (value: string) => {
+      setQuery(value);
+      doSearch(value, mode);
+    },
+    [mode, doSearch]
+  );
+
+  const handleModeChange = useCallback(
+    (newMode: SearchMode) => {
+      setMode(newMode);
+      if (query.trim().length >= 2) {
+        doSearch(query, newMode);
+      }
+    },
+    [query, doSearch]
   );
 
   return (
@@ -95,7 +120,11 @@ export function Search() {
             </svg>
             <input
               type="text"
-              placeholder="Search your archive..."
+              placeholder={
+                mode === "semantic"
+                  ? "Describe what you're looking for..."
+                  : "Search your archive..."
+              }
               value={query}
               onChange={(e) => handleSearch(e.target.value)}
               autoFocus
@@ -123,6 +152,41 @@ export function Search() {
                 </svg>
               </motion.div>
             )}
+          </div>
+
+          {/* Mode toggle */}
+          <div
+            className={css({
+              display: "flex",
+              gap: "2px",
+              marginTop: "sm",
+              bg: "bg.surface",
+              borderRadius: "md",
+              padding: "2px",
+              width: "fit-content",
+            })}
+          >
+            {(["keyword", "semantic"] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => handleModeChange(m)}
+                className={css({
+                  bg: mode === m ? "bg.elevated" : "transparent",
+                  border: "none",
+                  color: mode === m ? "text.primary" : "text.muted",
+                  fontSize: "xs",
+                  fontWeight: 500,
+                  padding: "4px 12px",
+                  borderRadius: "sm",
+                  cursor: "pointer",
+                  transition: "all 150ms",
+                  textTransform: "capitalize",
+                  _hover: { color: "text.primary" },
+                } as any)}
+              >
+                {m === "keyword" ? "Keyword" : "Semantic"}
+              </button>
+            ))}
           </div>
         </div>
       </header>
@@ -152,7 +216,9 @@ export function Search() {
                 fontSize: "sm",
               })}
             >
-              Search across all your documents, metadata, and content
+              {mode === "semantic"
+                ? "Find documents by meaning, not just keywords"
+                : "Search across all your documents, metadata, and content"}
             </motion.div>
           ) : results.length === 0 ? (
             <motion.div

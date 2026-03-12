@@ -27,7 +27,12 @@ pub struct Document {
     pub imported_at: String,
     pub updated_at: String,
     pub processed_at: Option<String>,
+    pub reading_status: Option<String>,
+    pub reading_progress: Option<f64>,
+    pub last_read_at: Option<String>,
     pub tags: Vec<String>,
+    pub duration_seconds: Option<f64>,
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +63,48 @@ pub struct LibraryStats {
     pub total_size_bytes: i64,
     pub format_counts: Vec<(String, i64)>,
     pub status_counts: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkSearchResult {
+    pub content: String,
+    pub chunk_index: usize,
+    pub distance: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LibraryChunkResult {
+    pub document_id: String,
+    pub document_title: String,
+    pub content: String,
+    pub chunk_index: usize,
+    pub distance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSession {
+    pub id: String,
+    pub title: String,
+    pub document_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub id: i64,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub sources: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TocEntry {
+    pub title: String,
+    pub level: i32,
+    pub href: Option<String>,
 }
 
 impl Database {
@@ -168,8 +215,102 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                chunk_index INTEGER NOT NULL,
+                byte_offset INTEGER NOT NULL,
+                content     TEXT NOT NULL,
+                UNIQUE(document_id, chunk_index)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunks_document ON document_chunks(document_id);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunk_embeddings USING vec0(
+                chunk_id INTEGER PRIMARY KEY,
+                embedding float[384]
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id          TEXT PRIMARY KEY,
+                title       TEXT NOT NULL DEFAULT 'New chat',
+                document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                sources     TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, created_at);
             ",
         )?;
+        // Add reading_status column if it doesn't exist (migration)
+        let _ = self.conn.execute(
+            "ALTER TABLE documents ADD COLUMN reading_status TEXT",
+            [],
+        );
+
+        // Reading progress tracking
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS reading_progress (
+                document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+                scroll_position REAL NOT NULL DEFAULT 0.0,
+                last_read_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS document_toc (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                title       TEXT NOT NULL,
+                level       INTEGER NOT NULL DEFAULT 1,
+                href        TEXT,
+                sort_order  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_toc_document ON document_toc(document_id, sort_order);
+
+            CREATE TABLE IF NOT EXISTS document_summaries (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                length      TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(document_id, length)
+            );
+
+            CREATE TABLE IF NOT EXISTS whisper_models (
+                id               TEXT PRIMARY KEY,
+                name             TEXT NOT NULL,
+                filename         TEXT NOT NULL,
+                size_bytes       INTEGER NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'available',
+                download_progress REAL DEFAULT 0.0,
+                downloaded_at    TEXT,
+                error            TEXT
+            );
+            ",
+        )?;
+
+        // Media-related columns on documents
+        let _ = self.conn.execute(
+            "ALTER TABLE documents ADD COLUMN duration_seconds REAL",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE documents ADD COLUMN source_url TEXT",
+            [],
+        );
+
         Ok(())
     }
 
@@ -190,6 +331,12 @@ impl Database {
     }
 
     pub fn has_hash(&self, hash: &str) -> Result<bool> {
+        // Only count completed documents as duplicates.
+        // Delete any pending/failed documents with this hash so retries work.
+        self.conn.execute(
+            "DELETE FROM documents WHERE file_hash = ?1 AND status = 'pending'",
+            params![hash],
+        )?;
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM documents WHERE file_hash = ?1",
             params![hash],
@@ -259,19 +406,79 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT d.*, GROUP_CONCAT(t.name, ', ') as tag_list
+    pub fn list_documents(
+        &self,
+        offset: i64,
+        limit: i64,
+        sort_by: Option<&str>,
+        sort_dir: Option<&str>,
+        format_filter: Option<&str>,
+        status_filter: Option<&str>,
+        tag_filter: Option<&str>,
+    ) -> Result<Vec<Document>> {
+        let order_col = match sort_by.unwrap_or("imported_at") {
+            "title" => "d.title COLLATE NOCASE",
+            "author" => "d.author COLLATE NOCASE",
+            "file_size" => "d.file_size",
+            "last_read" => "rp.last_read_at",
+            _ => "d.imported_at",
+        };
+        let dir = if sort_dir.unwrap_or("desc") == "asc" { "ASC" } else { "DESC" };
+        let nulls = if dir == "DESC" { "NULLS LAST" } else { "NULLS FIRST" };
+
+        let mut sql = String::from(
+            "SELECT d.*, rp.scroll_position, rp.last_read_at as rp_last_read,
+                    GROUP_CONCAT(t.name, ', ') as tag_list
              FROM documents d
+             LEFT JOIN reading_progress rp ON d.id = rp.document_id
              LEFT JOIN document_tags dt ON d.id = dt.document_id
-             LEFT JOIN tags t ON dt.tag_id = t.id
-             GROUP BY d.id
-             ORDER BY d.imported_at DESC
-             LIMIT ?1 OFFSET ?2",
-        )?;
+             LEFT JOIN tags t ON dt.tag_id = t.id",
+        );
+
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(fmt) = format_filter {
+            if !fmt.is_empty() {
+                param_values.push(Box::new(fmt.to_string()));
+                conditions.push(format!("d.original_format = ?{}", param_values.len()));
+            }
+        }
+        if let Some(status) = status_filter {
+            if !status.is_empty() {
+                param_values.push(Box::new(status.to_string()));
+                conditions.push(format!("d.reading_status = ?{}", param_values.len()));
+            }
+        }
+        if let Some(tag) = tag_filter {
+            if !tag.is_empty() {
+                param_values.push(Box::new(tag.to_string()));
+                conditions.push(format!(
+                    "d.id IN (SELECT dt2.document_id FROM document_tags dt2 JOIN tags t2 ON dt2.tag_id = t2.id WHERE t2.name = ?{})",
+                    param_values.len()
+                ));
+            }
+        }
+
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+
+        sql.push_str(" GROUP BY d.id");
+        sql.push_str(&format!(" ORDER BY {} {} {}", order_col, dir, nulls));
+
+        param_values.push(Box::new(limit));
+        sql.push_str(&format!(" LIMIT ?{}", param_values.len()));
+        param_values.push(Box::new(offset));
+        sql.push_str(&format!(" OFFSET ?{}", param_values.len()));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
 
         let docs = stmt
-            .query_map(params![limit, offset], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 let tag_str: Option<String> = row.get("tag_list")?;
                 let tags = tag_str
                     .map(|s| s.split(", ").map(String::from).collect())
@@ -298,7 +505,12 @@ impl Database {
                     imported_at: row.get("imported_at")?,
                     updated_at: row.get("updated_at")?,
                     processed_at: row.get("processed_at")?,
+                    reading_status: row.get("reading_status").unwrap_or(None),
+                    reading_progress: row.get("scroll_position").unwrap_or(None),
+                    last_read_at: row.get("rp_last_read").unwrap_or(None),
                     tags,
+                    duration_seconds: row.get("duration_seconds").unwrap_or(None),
+                    source_url: row.get("source_url").unwrap_or(None),
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -308,8 +520,10 @@ impl Database {
 
     pub fn get_document(&self, id: &str) -> Result<Option<Document>> {
         let mut stmt = self.conn.prepare(
-            "SELECT d.*, GROUP_CONCAT(t.name, ', ') as tag_list
+            "SELECT d.*, rp.scroll_position, rp.last_read_at as rp_last_read,
+                    GROUP_CONCAT(t.name, ', ') as tag_list
              FROM documents d
+             LEFT JOIN reading_progress rp ON d.id = rp.document_id
              LEFT JOIN document_tags dt ON d.id = dt.document_id
              LEFT JOIN tags t ON dt.tag_id = t.id
              WHERE d.id = ?1
@@ -343,7 +557,12 @@ impl Database {
                 imported_at: row.get("imported_at")?,
                 updated_at: row.get("updated_at")?,
                 processed_at: row.get("processed_at")?,
+                reading_status: row.get("reading_status").unwrap_or(None),
+                reading_progress: row.get("scroll_position").unwrap_or(None),
+                last_read_at: row.get("rp_last_read").unwrap_or(None),
                 tags,
+                duration_seconds: row.get("duration_seconds").unwrap_or(None),
+                source_url: row.get("source_url").unwrap_or(None),
             })
         })?;
 
@@ -363,12 +582,25 @@ impl Database {
             )
             .ok();
 
+        // Clean up embeddings first (vec0 virtual table doesn't cascade)
+        self.delete_document_chunks(id)?;
+
         self.conn
             .execute("DELETE FROM documents WHERE id = ?1", params![id])?;
         Ok(path)
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<SearchResult>> {
+        // Build FTS query with prefix matching: each term gets a trailing *
+        let fts_query = query
+            .split_whitespace()
+            .map(|term| {
+                let escaped = term.replace('"', "\"\"");
+                format!("\"{}\"*", escaped)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
         let mut stmt = self.conn.prepare(
             "SELECT
                 fc.document_id as id,
@@ -383,7 +615,39 @@ impl Database {
         )?;
 
         let results = stmt
-            .query_map(params![query, limit], |row| {
+            .query_map(params![fts_query, limit], |row| {
+                Ok(SearchResult {
+                    id: row.get("id")?,
+                    title: row.get("title")?,
+                    author: row.get("author")?,
+                    original_format: row.get("original_format")?,
+                    snippet: row.get("snippet")?,
+                    cover_path: row.get("cover_path")?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        // LIKE fallback when FTS returns nothing
+        if results.is_empty() {
+            return self.search_like(query, limit);
+        }
+
+        Ok(results)
+    }
+
+    fn search_like(&self, query: &str, limit: i64) -> Result<Vec<SearchResult>> {
+        let pattern = format!("%{}%", query);
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.title, d.author, d.original_format, d.cover_path,
+                    COALESCE(d.description, '') as snippet
+             FROM documents d
+             WHERE d.title LIKE ?1 OR d.author LIKE ?1 OR d.description LIKE ?1
+             ORDER BY d.imported_at DESC
+             LIMIT ?2",
+        )?;
+
+        let results = stmt
+            .query_map(params![pattern, limit], |row| {
                 Ok(SearchResult {
                     id: row.get("id")?,
                     title: row.get("title")?,
@@ -492,5 +756,618 @@ impl Database {
             [],
         )?;
         Ok(())
+    }
+
+    pub fn insert_chunks(
+        &self,
+        document_id: &str,
+        chunks: &[crate::embeddings::Chunk],
+        embeddings: &[Vec<f32>],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
+            tx.execute(
+                "INSERT INTO document_chunks (document_id, chunk_index, byte_offset, content)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![document_id, chunk.index as i64, chunk.offset as i64, chunk.text],
+            )?;
+
+            let chunk_id = tx.last_insert_rowid();
+            let embedding_bytes: Vec<u8> = embedding
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+
+            tx.execute(
+                "INSERT INTO chunk_embeddings (chunk_id, embedding) VALUES (?1, ?2)",
+                params![chunk_id, embedding_bytes],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn search_chunks(
+        &self,
+        query_embedding: &[f32],
+        document_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ChunkSearchResult>> {
+        let embedding_bytes: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        // sqlite-vec requires k=? in the WHERE clause, not a LIMIT
+        let mut stmt = self.conn.prepare(
+            "SELECT dc.content, dc.chunk_index, ce.distance
+             FROM chunk_embeddings ce
+             JOIN document_chunks dc ON dc.id = ce.chunk_id
+             WHERE ce.embedding MATCH ?1
+               AND ce.k = ?2
+               AND dc.document_id = ?3
+             ORDER BY ce.distance",
+        )?;
+
+        let results = stmt
+            .query_map(params![embedding_bytes, limit as i64, document_id], |row| {
+                Ok(ChunkSearchResult {
+                    content: row.get(0)?,
+                    chunk_index: row.get::<_, i64>(1)? as usize,
+                    distance: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    pub fn has_chunks(&self, document_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM document_chunks WHERE document_id = ?1",
+            params![document_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn delete_document_chunks(&self, document_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chunk_embeddings WHERE chunk_id IN
+             (SELECT id FROM document_chunks WHERE document_id = ?1)",
+            params![document_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM document_chunks WHERE document_id = ?1",
+            params![document_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn search_semantic(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let embedding_bytes: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        // Fetch a large candidate pool, then deduplicate by document
+        let fetch_k = limit * 6;
+        let mut stmt = self.conn.prepare(
+            "SELECT dc.content, dc.chunk_index, ce.distance,
+                    dc.document_id, d.title, d.author, d.original_format, d.cover_path
+             FROM chunk_embeddings ce
+             JOIN document_chunks dc ON dc.id = ce.chunk_id
+             JOIN documents d ON d.id = dc.document_id
+             WHERE ce.embedding MATCH ?1
+               AND ce.k = ?2
+             ORDER BY ce.distance",
+        )?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::new();
+
+        let rows = stmt.query_map(params![embedding_bytes, fetch_k as i64], |row| {
+            Ok((
+                row.get::<_, String>(3)?,  // document_id
+                row.get::<_, String>(4)?,  // title
+                row.get::<_, String>(5)?,  // author
+                row.get::<_, String>(6)?,  // original_format
+                row.get::<_, Option<String>>(7)?, // cover_path
+                row.get::<_, String>(0)?,  // chunk content (for snippet)
+            ))
+        })?;
+
+        for row in rows {
+            let (doc_id, title, author, format, cover_path, content) = row?;
+            if seen.contains(&doc_id) {
+                continue;
+            }
+            seen.insert(doc_id.clone());
+
+            let snippet = if content.len() > 300 {
+                format!("{}...", &content[..300])
+            } else {
+                content
+            };
+
+            results.push(SearchResult {
+                id: doc_id,
+                title,
+                author,
+                original_format: format,
+                snippet,
+                cover_path,
+            });
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn search_semantic_excluding(
+        &self,
+        query_embedding: &[f32],
+        exclude_document_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let embedding_bytes: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let fetch_k = (limit + 1) * 6;
+        let mut stmt = self.conn.prepare(
+            "SELECT dc.content, dc.chunk_index, ce.distance,
+                    dc.document_id, d.title, d.author, d.original_format, d.cover_path
+             FROM chunk_embeddings ce
+             JOIN document_chunks dc ON dc.id = ce.chunk_id
+             JOIN documents d ON d.id = dc.document_id
+             WHERE ce.embedding MATCH ?1
+               AND ce.k = ?2
+             ORDER BY ce.distance",
+        )?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::new();
+
+        let rows = stmt.query_map(params![embedding_bytes, fetch_k as i64], |row| {
+            Ok((
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(0)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (doc_id, title, author, format, cover_path, content) = row?;
+            if doc_id == exclude_document_id || seen.contains(&doc_id) {
+                continue;
+            }
+            seen.insert(doc_id.clone());
+
+            let snippet = if content.len() > 300 {
+                format!("{}...", &content[..300])
+            } else {
+                content
+            };
+
+            results.push(SearchResult {
+                id: doc_id,
+                title,
+                author,
+                original_format: format,
+                snippet,
+                cover_path,
+            });
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn list_unembedded_document_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id FROM documents d
+             WHERE d.status = 'complete'
+               AND d.markdown_path IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM document_chunks dc WHERE dc.document_id = d.id)",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
+    pub fn get_embedding_stats(&self) -> Result<(i64, i64)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM documents WHERE status = 'complete'",
+            [],
+            |row| row.get(0),
+        )?;
+        let embedded: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT document_id) FROM document_chunks",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((total, embedded))
+    }
+
+    pub fn list_documents_without_covers(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, original_format, original_path FROM documents
+             WHERE cover_path IS NULL AND status = 'complete'",
+        )?;
+        let results = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
+    pub fn set_cover_path(&self, id: &str, cover_path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE documents SET cover_path = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![id, cover_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_reading_status(&self, id: &str, status: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE documents SET reading_status = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![id, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn search_all_chunks(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<LibraryChunkResult>> {
+        let embedding_bytes: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT dc.content, dc.chunk_index, ce.distance,
+                    dc.document_id, d.title AS document_title
+             FROM chunk_embeddings ce
+             JOIN document_chunks dc ON dc.id = ce.chunk_id
+             JOIN documents d ON d.id = dc.document_id
+             WHERE ce.embedding MATCH ?1
+               AND ce.k = ?2
+             ORDER BY ce.distance",
+        )?;
+
+        let results = stmt
+            .query_map(params![embedding_bytes, limit as i64], |row| {
+                Ok(LibraryChunkResult {
+                    content: row.get(0)?,
+                    chunk_index: row.get::<_, i64>(1)? as usize,
+                    distance: row.get(2)?,
+                    document_id: row.get(3)?,
+                    document_title: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    pub fn create_chat_session(
+        &self,
+        id: &str,
+        title: &str,
+        document_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO chat_sessions (id, title, document_id) VALUES (?1, ?2, ?3)",
+            params![id, title, document_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_chat_sessions(
+        &self,
+        document_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ChatSession>> {
+        let (sql, use_doc_filter) = match document_id {
+            Some(_) => (
+                "SELECT id, title, document_id, created_at, updated_at
+                 FROM chat_sessions WHERE document_id = ?1
+                 ORDER BY updated_at DESC LIMIT ?2",
+                true,
+            ),
+            None => (
+                "SELECT id, title, document_id, created_at, updated_at
+                 FROM chat_sessions WHERE document_id IS NULL
+                 ORDER BY updated_at DESC LIMIT ?1",
+                false,
+            ),
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let sessions = if use_doc_filter {
+            stmt.query_map(params![document_id.unwrap(), limit], |row| {
+                Ok(ChatSession {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    document_id: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![limit], |row| {
+                Ok(ChatSession {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    document_id: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?
+        };
+
+        Ok(sessions)
+    }
+
+    pub fn delete_chat_session(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM chat_sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn update_chat_session_title(&self, id: &str, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_sessions SET title = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_chat_message(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        sources: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO chat_messages (session_id, role, content, sources) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, role, content, sources],
+        )?;
+        self.conn.execute(
+            "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    // --- Reading progress ---
+
+    pub fn save_reading_progress(&self, document_id: &str, position: f64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO reading_progress (document_id, scroll_position, last_read_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(document_id) DO UPDATE SET
+                scroll_position = excluded.scroll_position,
+                last_read_at = excluded.last_read_at",
+            params![document_id, position],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_reading_progress(&self, document_id: &str) -> Result<Option<f64>> {
+        let result = self.conn.query_row(
+            "SELECT scroll_position FROM reading_progress WHERE document_id = ?1",
+            params![document_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(pos) => Ok(Some(pos)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    // --- Table of contents ---
+
+    pub fn insert_toc(&self, document_id: &str, entries: &[TocEntry]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM document_toc WHERE document_id = ?1",
+            params![document_id],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO document_toc (document_id, title, level, href, sort_order)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (i, entry) in entries.iter().enumerate() {
+            stmt.execute(params![
+                document_id,
+                entry.title,
+                entry.level,
+                entry.href,
+                i as i64
+            ])?;
+        }
+        Ok(())
+    }
+
+    pub fn get_toc(&self, document_id: &str) -> Result<Vec<TocEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT title, level, href FROM document_toc
+             WHERE document_id = ?1 ORDER BY sort_order",
+        )?;
+        let entries = stmt
+            .query_map(params![document_id], |row| {
+                Ok(TocEntry {
+                    title: row.get(0)?,
+                    level: row.get(1)?,
+                    href: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(entries)
+    }
+
+    // --- Summaries ---
+
+    pub fn insert_summary(&self, document_id: &str, length: &str, content: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO document_summaries (document_id, length, content)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(document_id, length) DO UPDATE SET
+                content = excluded.content,
+                created_at = datetime('now')",
+            params![document_id, length, content],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_summary(&self, document_id: &str, length: &str) -> Result<Option<String>> {
+        let result = self.conn.query_row(
+            "SELECT content FROM document_summaries WHERE document_id = ?1 AND length = ?2",
+            params![document_id, length],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(content) => Ok(Some(content)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn get_all_summaries(&self, document_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT length, content FROM document_summaries WHERE document_id = ?1",
+        )?;
+        let results = stmt
+            .query_map(params![document_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
+    // --- Tags ---
+
+    pub fn list_all_tags(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT t.name FROM tags t
+             JOIN document_tags dt ON t.id = dt.tag_id
+             ORDER BY t.name COLLATE NOCASE",
+        )?;
+        let tags = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>>>()?;
+        Ok(tags)
+    }
+
+    // --- Whisper model management ---
+
+    pub fn seed_whisper_models(&self) -> Result<()> {
+        for model in crate::whisper::WHISPER_MODELS {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO whisper_models (id, name, filename, size_bytes, status) VALUES (?1, ?2, ?3, ?4, 'available')",
+                params![model.id, model.name, model.filename, model.size_bytes],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_whisper_models(&self) -> Result<Vec<crate::whisper::WhisperModel>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, filename, size_bytes, status, download_progress, downloaded_at, error FROM whisper_models ORDER BY size_bytes ASC",
+        )?;
+        let models = stmt
+            .query_map([], |row| {
+                Ok(crate::whisper::WhisperModel {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    filename: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    status: row.get(4)?,
+                    download_progress: row.get(5)?,
+                    downloaded_at: row.get(6)?,
+                    error: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(models)
+    }
+
+    pub fn update_whisper_model_status(
+        &self,
+        id: &str,
+        status: &str,
+        progress: f64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if status == "ready" {
+            self.conn.execute(
+                "UPDATE whisper_models SET status = ?2, download_progress = ?3, error = ?4, downloaded_at = datetime('now') WHERE id = ?1",
+                params![id, status, progress, error],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE whisper_models SET status = ?2, download_progress = ?3, error = ?4 WHERE id = ?1",
+                params![id, status, progress, error],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn update_document_media_metadata(
+        &self,
+        id: &str,
+        duration_seconds: Option<f64>,
+        source_url: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE documents SET duration_seconds = ?2, source_url = ?3 WHERE id = ?1",
+            params![id, duration_seconds, source_url],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_chat_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, role, content, sources, created_at
+             FROM chat_messages WHERE session_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+
+        let messages = stmt
+            .query_map(params![session_id], |row| {
+                Ok(ChatMessage {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    sources: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(messages)
     }
 }
