@@ -2,6 +2,7 @@ use crate::claude::ClaudeClient;
 use crate::config::ConfigManager;
 use crate::db::Database;
 use crate::storage::StorageLayout;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -12,9 +13,171 @@ fn extract_pdf_text(path: &Path) -> Result<String, String> {
         .map_err(|e| format!("Failed to extract PDF text: {}", e))
 }
 
-/// Extract text locally from a text-based file
+/// Extract text from an EPUB file (ZIP of XHTML files)
+fn extract_epub_text(path: &Path) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("Failed to open EPUB: {}", e))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Failed to read EPUB archive: {}", e))?;
+
+    // Read the container.xml to find the content files in order
+    let content_paths = epub_content_order(&mut archive);
+
+    let mut all_text = String::new();
+    for content_path in &content_paths {
+        if let Ok(mut entry) = archive.by_name(content_path) {
+            let mut html = String::new();
+            if entry.read_to_string(&mut html).is_ok() {
+                let text = html2text::from_read(html.as_bytes(), 120)
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    all_text.push_str(&text);
+                    all_text.push('\n');
+                }
+            }
+        }
+    }
+
+    // Fallback: if content order detection failed, just grab all xhtml/html files
+    if all_text.trim().is_empty() {
+        for i in 0..archive.len() {
+            if let Ok(mut entry) = archive.by_index(i) {
+                let name = entry.name().to_lowercase();
+                if name.ends_with(".xhtml")
+                    || name.ends_with(".html")
+                    || name.ends_with(".htm")
+                    || name.ends_with(".xml")
+                {
+                    let mut html = String::new();
+                    if entry.read_to_string(&mut html).is_ok() {
+                        let text = html2text::from_read(html.as_bytes(), 120)
+                            .unwrap_or_default();
+                        if !text.trim().is_empty() {
+                            all_text.push_str(&text);
+                            all_text.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if all_text.trim().is_empty() {
+        Err("No text content found in EPUB".to_string())
+    } else {
+        Ok(all_text)
+    }
+}
+
+/// Parse EPUB's container.xml → content.opf → spine to get reading order
+fn epub_content_order(archive: &mut zip::ZipArchive<std::fs::File>) -> Vec<String> {
+    // 1. Find the .opf file path from META-INF/container.xml
+    let opf_path = (|| -> Option<String> {
+        let mut container = archive.by_name("META-INF/container.xml").ok()?;
+        let mut xml = String::new();
+        container.read_to_string(&mut xml).ok()?;
+        // Quick parse: find rootfile full-path="..."
+        let marker = "full-path=\"";
+        let start = xml.find(marker)? + marker.len();
+        let end = xml[start..].find('"')? + start;
+        Some(xml[start..end].to_string())
+    })();
+
+    let opf_path = match opf_path {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    // Base directory of the OPF file
+    let opf_dir = opf_path
+        .rfind('/')
+        .map(|i| &opf_path[..i + 1])
+        .unwrap_or("");
+
+    // 2. Parse the OPF to get manifest (id → href) and spine (ordered idrefs)
+    let parsed = (|| -> Option<(Vec<(String, String)>, Vec<String>)> {
+        let mut opf_entry = archive.by_name(&opf_path).ok()?;
+        let mut xml = String::new();
+        opf_entry.read_to_string(&mut xml).ok()?;
+
+        // Extract manifest items: <item id="..." href="..." .../>
+        let mut manifest = Vec::new();
+        for item_start in xml.match_indices("<item ").map(|(i, _)| i) {
+            let chunk = &xml[item_start..];
+            let item_end = match chunk.find("/>").or_else(|| chunk.find("</item>")) {
+                Some(e) => e,
+                None => continue,
+            };
+            let tag = &chunk[..item_end];
+
+            if let (Some(id), Some(href)) = (extract_attr(tag, "id"), extract_attr(tag, "href")) {
+                manifest.push((id, href));
+            }
+        }
+
+        // Extract spine idrefs: <itemref idref="..."/>
+        let mut spine = Vec::new();
+        for itemref_start in xml.match_indices("<itemref ").map(|(i, _)| i) {
+            let chunk = &xml[itemref_start..];
+            let tag_end = match chunk.find("/>") {
+                Some(e) => e,
+                None => continue,
+            };
+            let tag = &chunk[..tag_end];
+            if let Some(idref) = extract_attr(tag, "idref") {
+                spine.push(idref);
+            }
+        }
+
+        Some((manifest, spine))
+    })();
+
+    let (manifest, spine) = match parsed {
+        Some((m, s)) => (m, s),
+        None => return Vec::new(),
+    };
+
+    // 3. Resolve spine idrefs to file paths
+    spine
+        .iter()
+        .filter_map(|idref| {
+            manifest
+                .iter()
+                .find(|(id, _)| id == idref)
+                .map(|(_, href)| format!("{}{}", opf_dir, href))
+        })
+        .collect()
+}
+
+/// Extract an XML attribute value from a tag string
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{}=\"", attr);
+    let start = tag.find(&pattern)? + pattern.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+/// Extract text from an HTML file
+fn extract_html_text(path: &Path) -> Result<String, String> {
+    let html = std::fs::read(path).map_err(|e| format!("Failed to read HTML: {}", e))?;
+    html2text::from_read(&html[..], 120)
+        .map_err(|e| format!("Failed to convert HTML to text: {}", e))
+}
+
+/// Extract text locally from a plain text file
 fn extract_text_content(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))
+}
+
+/// Attempt local text extraction for any supported format
+fn extract_local_text(path: &Path, format: &str) -> Result<String, String> {
+    match format {
+        "pdf" => extract_pdf_text(path),
+        "epub" => extract_epub_text(path),
+        "html" | "htm" => extract_html_text(path),
+        "txt" | "md" => extract_text_content(path),
+        // MOBI, DjVu, CBZ/CBR — no local extractor, Claude-only
+        _ => Err(format!("No local text extractor for .{} files", format)),
+    }
 }
 
 /// Derive a basic title from the filename
@@ -99,11 +262,7 @@ pub async fn import_file(
     }
 
     let stored_path = storage.resolve_original(&original_path);
-    let local_text = match format.as_str() {
-        "pdf" => extract_pdf_text(&stored_path),
-        "txt" | "md" | "html" | "htm" => extract_text_content(&stored_path),
-        _ => Ok(String::new()),
-    };
+    let local_text = extract_local_text(&stored_path, &format);
 
     let fallback_title = title_from_filename(source_path);
 

@@ -31,3 +31,5 @@ walkdir = "2"
 mime_guess = "2"
 thiserror = "2"
 pdf-extract = "0.10.0"
+html2text = "0.16.7"
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }

@@ -100,6 +100,37 @@ For the markdown_content:
 
 Return ONLY the JSON object, no other text."#;
 
+/// Attempt to repair truncated JSON from Claude when output hits the token limit.
+/// The most common case: markdown_content is cut off mid-string.
+fn repair_truncated_json(json: &str) -> Option<ExtractionResult> {
+    // Find the last complete key-value before truncation
+    // Strategy: try closing open strings, arrays, and the root object
+    let mut repaired = json.to_string();
+
+    // If we're inside an unclosed string, close it
+    let quote_count = repaired.matches('"').count()
+        - repaired.matches("\\\"").count();
+    if quote_count % 2 != 0 {
+        repaired.push('"');
+    }
+
+    // Close any open arrays
+    let open_brackets = repaired.matches('[').count();
+    let close_brackets = repaired.matches(']').count();
+    for _ in 0..(open_brackets.saturating_sub(close_brackets)) {
+        repaired.push(']');
+    }
+
+    // Close any open objects
+    let open_braces = repaired.matches('{').count();
+    let close_braces = repaired.matches('}').count();
+    for _ in 0..(open_braces.saturating_sub(close_braces)) {
+        repaired.push('}');
+    }
+
+    serde_json::from_str::<ExtractionResult>(&repaired).ok()
+}
+
 /// Parse a context overflow error to extract input token count and context limit.
 /// Error format: "... context limit: 152815 + 64000 > 200000, ..."
 fn parse_context_overflow(body: &str) -> Option<(u64, u64)> {
@@ -335,15 +366,20 @@ impl ClaudeClient {
                 .unwrap_or(text.trim())
                 .trim();
 
-            let result: ExtractionResult = serde_json::from_str(json_str).map_err(|e| {
-                format!(
-                    "Failed to parse extraction result: {}. Raw response: {}",
-                    e,
-                    &text[..text.len().min(500)]
-                )
-            })?;
+            // Try parsing directly first
+            if let Ok(result) = serde_json::from_str::<ExtractionResult>(json_str) {
+                return Ok(result);
+            }
 
-            return Ok(result);
+            // If JSON is truncated (output hit token limit), try to repair it
+            if let Some(result) = repair_truncated_json(json_str) {
+                return Ok(result);
+            }
+
+            return Err(format!(
+                "Failed to parse Claude's response as JSON (output may have been truncated). First 500 chars: {}",
+                &text[..text.len().min(500)]
+            ));
         }
     }
 }
