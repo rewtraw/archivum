@@ -501,6 +501,47 @@ export async function deleteOllamaModel(name: string): Promise<void> {
   return invoke("delete_ollama_model", { name });
 }
 
+export interface HardwareInfo {
+  total_ram_gb: number;
+  cpu_name: string;
+  gpu_name: string | null;
+  gpu_vram_gb: number | null;
+  unified_memory: boolean;
+  backend: string;
+}
+
+export interface ModelFitInfo {
+  name: string;
+  parameter_count: string;
+  use_case: string;
+  fit_level: string;
+  run_mode: string;
+  memory_required_gb: number;
+  estimated_tps: number;
+  best_quant: string;
+  score: number;
+  score_quality: number;
+  score_speed: number;
+  score_fit: number;
+  score_context: number;
+  context_length: number;
+  installed: boolean;
+}
+
+export async function getSystemHardware(): Promise<HardwareInfo> {
+  return invoke("get_system_hardware");
+}
+
+export async function getModelFits(
+  limit?: number,
+  useCaseFilter?: string
+): Promise<ModelFitInfo[]> {
+  return invoke("get_model_fits", {
+    limit: limit ?? null,
+    useCaseFilter: useCaseFilter ?? null,
+  });
+}
+
 export function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);

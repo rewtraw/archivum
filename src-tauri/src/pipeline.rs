@@ -30,8 +30,12 @@ async fn enrich_metadata_dispatch(
 /// Extract text locally from a PDF using pdf-extract
 fn extract_pdf_text(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Failed to read PDF: {}", e))?;
-    pdf_extract::extract_text_from_mem(&bytes)
-        .map_err(|e| format!("Failed to extract PDF text: {}", e))
+    // pdf-extract can panic on malformed PDFs — catch it
+    std::panic::catch_unwind(|| {
+        pdf_extract::extract_text_from_mem(&bytes)
+    })
+    .map_err(|_| "PDF text extraction panicked (malformed PDF)".to_string())?
+    .map_err(|e| format!("Failed to extract PDF text: {}", e))
 }
 
 /// Extract text from an EPUB file (ZIP of XHTML files)
@@ -608,6 +612,13 @@ fn finish_import(
         )
         .map_err(|e| e.to_string())?;
 
+    // Store tags in the relational tables
+    if !tags.is_empty() {
+        if let Err(e) = db_lock.set_document_tags(doc_id, tags) {
+            eprintln!("[pipeline] tag storage failed: {}", e);
+        }
+    }
+
     // Embed chunks for RAG (non-fatal)
     if let Some(engine) = embeddings {
         let chunks = embeddings::chunk_markdown(markdown_content);
@@ -1070,6 +1081,11 @@ fn get_whisper_model(
 /// Public wrappers for cover extraction (used by regenerate_covers command)
 pub fn extract_epub_cover_public(path: &Path) -> Option<Vec<u8>> {
     extract_epub_cover(path)
+}
+
+/// Public wrapper for local text extraction (used by reembed_document fallback)
+pub fn extract_local_text_public(path: &Path, format: &str) -> Result<String, String> {
+    extract_local_text(path, format)
 }
 
 pub fn extract_pdf_cover_public(path: &Path) -> Option<Vec<u8>> {

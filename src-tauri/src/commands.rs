@@ -549,7 +549,7 @@ pub async fn ask_document(
 
     if chunks.is_empty() {
         let _ = on_token.send(ChatEvent::Error {
-            message: "No indexed content found for this document. Try re-importing it.".to_string(),
+            message: "This document hasn't been indexed yet. Close the chat and click \"Generate index\" first.".to_string(),
         });
         return Ok(());
     }
@@ -614,10 +614,37 @@ pub async fn reembed_document(
     document_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let markdown = state
-        .storage
-        .read_markdown(&document_id)
-        .map_err(|e| format!("Failed to read markdown: {}", e))?;
+    // Try reading existing markdown; if missing, extract from original file
+    let markdown = match state.storage.read_markdown(&document_id) {
+        Ok(md) => {
+            eprintln!("[reembed] Found existing markdown for {} ({} bytes)", document_id, md.len());
+            md
+        }
+        Err(e) => {
+            eprintln!("[reembed] No markdown file for {}: {}", document_id, e);
+            // No markdown on disk — extract text from the original file
+            let doc = {
+                let db = state.db.lock().unwrap();
+                db.get_document(&document_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Document not found".to_string())?
+            };
+            let stored_path = state.storage.resolve_original(&doc.original_path);
+            let text = crate::pipeline::extract_local_text_public(&stored_path, &doc.original_format)
+                .map_err(|e| format!("Failed to extract text: {}", e))?;
+            if text.trim().is_empty() {
+                return Err("No text content could be extracted from this document".to_string());
+            }
+            // Write the markdown so future calls don't need to re-extract
+            let md_path = state.storage
+                .write_markdown(&document_id, &text)
+                .map_err(|e| format!("Failed to write markdown: {}", e))?;
+            let db = state.db.lock().unwrap();
+            db.set_markdown_path(&document_id, &md_path)
+                .map_err(|e| e.to_string())?;
+            text
+        }
+    };
 
     let data_dir = state.storage.originals_dir().parent().unwrap().to_path_buf();
     let engine = state
@@ -629,17 +656,20 @@ pub async fn reembed_document(
         .map_err(|e| format!("Embedding engine failed: {}", e))?;
 
     let chunks = crate::embeddings::chunk_markdown(&markdown);
+    eprintln!("[reembed] {} chunks from {} bytes of markdown", chunks.len(), markdown.len());
     if chunks.is_empty() {
         return Err("Document has no content to embed".to_string());
     }
 
     let embeddings = engine.embed_chunks(&chunks)?;
+    eprintln!("[reembed] Embedded {} chunks, storing...", embeddings.len());
 
     let db = state.db.lock().unwrap();
     db.delete_document_chunks(&document_id)
         .map_err(|e| e.to_string())?;
     db.insert_chunks(&document_id, &chunks, &embeddings)
         .map_err(|e| e.to_string())?;
+    eprintln!("[reembed] Done for {}", document_id);
 
     Ok(())
 }
@@ -1509,6 +1539,113 @@ pub async fn list_recommended_ollama_models() -> Result<Vec<RecommendedModelInfo
             description: m.description.to_string(),
         })
         .collect())
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct HardwareInfo {
+    pub total_ram_gb: f64,
+    pub cpu_name: String,
+    pub gpu_name: Option<String>,
+    pub gpu_vram_gb: Option<f64>,
+    pub unified_memory: bool,
+    pub backend: String,
+}
+
+#[tauri::command]
+pub async fn get_system_hardware(
+    state: State<'_, AppState>,
+) -> Result<HardwareInfo, String> {
+    let specs = &state.system_specs;
+    Ok(HardwareInfo {
+        total_ram_gb: specs.total_ram_gb,
+        cpu_name: specs.cpu_name.clone(),
+        gpu_name: specs.gpu_name.clone(),
+        gpu_vram_gb: specs.gpu_vram_gb,
+        unified_memory: specs.unified_memory,
+        backend: specs.backend.label().to_string(),
+    })
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ModelFitInfo {
+    pub name: String,
+    pub parameter_count: String,
+    pub use_case: String,
+    pub fit_level: String,
+    pub run_mode: String,
+    pub memory_required_gb: f64,
+    pub estimated_tps: f64,
+    pub best_quant: String,
+    pub score: f64,
+    pub score_quality: f64,
+    pub score_speed: f64,
+    pub score_fit: f64,
+    pub score_context: f64,
+    pub context_length: u32,
+    pub installed: bool,
+}
+
+#[tauri::command]
+pub async fn get_model_fits(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+    use_case_filter: Option<String>,
+) -> Result<Vec<ModelFitInfo>, String> {
+    let specs = &state.system_specs;
+    let db = llmfit_core::ModelDatabase::new();
+
+    // Get installed Ollama model names for cross-referencing
+    let base_url = state.config.lock().unwrap().load().ollama_base_url;
+    let client = crate::ollama::OllamaClient::new();
+    let installed_names: std::collections::HashSet<String> =
+        match client.list_models(&base_url).await {
+            Ok(models) => models.into_iter().map(|m| m.name.to_lowercase()).collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
+
+    let mut fits: Vec<ModelFitInfo> = db
+        .get_all_models()
+        .iter()
+        .map(|model| {
+            let fit = llmfit_core::ModelFit::analyze(model, specs);
+            let name_lower = model.name.to_lowercase();
+            let stem = name_lower.split(':').next().unwrap_or(&name_lower);
+            let installed = installed_names.contains(&name_lower)
+                || installed_names.contains(&format!("{}:latest", stem));
+            ModelFitInfo {
+                name: model.name.clone(),
+                parameter_count: model.parameter_count.clone(),
+                use_case: fit.use_case.label().to_string(),
+                fit_level: format!("{:?}", fit.fit_level),
+                run_mode: format!("{:?}", fit.run_mode),
+                memory_required_gb: fit.memory_required_gb,
+                estimated_tps: fit.estimated_tps,
+                best_quant: fit.best_quant.clone(),
+                score: fit.score,
+                score_quality: fit.score_components.quality,
+                score_speed: fit.score_components.speed,
+                score_fit: fit.score_components.fit,
+                score_context: fit.score_components.context,
+                context_length: model.context_length,
+                installed,
+            }
+        })
+        .filter(|f| f.fit_level != "TooTight")
+        .filter(|f| {
+            if let Some(ref uc) = use_case_filter {
+                f.use_case.to_lowercase() == uc.to_lowercase()
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    fits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    let limit = limit.unwrap_or(30);
+    fits.truncate(limit);
+
+    Ok(fits)
 }
 
 #[tauri::command]

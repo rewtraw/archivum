@@ -17,6 +17,7 @@ pub struct AppState {
     pub storage: storage::StorageLayout,
     pub config: Arc<Mutex<config::ConfigManager>>,
     pub embeddings: Arc<OnceCell<embeddings::EmbeddingEngine>>,
+    pub system_specs: llmfit_core::SystemSpecs,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -49,11 +50,14 @@ pub fn run() {
 
             let config_mgr = config::ConfigManager::new(&data_dir);
 
+            let system_specs = llmfit_core::SystemSpecs::detect();
+
             let state = AppState {
                 db: Arc::new(Mutex::new(database)),
                 storage,
                 config: Arc::new(Mutex::new(config_mgr)),
                 embeddings: Arc::new(OnceCell::new()),
+                system_specs,
             };
 
             app.manage(state);
@@ -110,6 +114,8 @@ pub fn run() {
             commands::check_ollama_status,
             commands::list_ollama_models,
             commands::list_recommended_ollama_models,
+            commands::get_system_hardware,
+            commands::get_model_fits,
             commands::pull_ollama_model,
             commands::delete_ollama_model,
         ])

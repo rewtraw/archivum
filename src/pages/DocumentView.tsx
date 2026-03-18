@@ -726,6 +726,20 @@ export function DocumentView() {
                       const slug = text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
                       return <h3 id={slug} {...props}>{children}</h3>;
                     },
+                    a: ({ href, children, ...props }) => (
+                      <a
+                        {...props}
+                        href={href}
+                        onClick={(e) => {
+                          if (href && (href.startsWith("http://") || href.startsWith("https://"))) {
+                            e.preventDefault();
+                            openPath(href);
+                          }
+                        }}
+                      >
+                        {children}
+                      </a>
+                    ),
                   }}
                 >{markdown}</ReactMarkdown>
               ) : doc.status === "processing" ? (
@@ -736,79 +750,6 @@ export function DocumentView() {
                 <div className={css({ color: "text.muted", textAlign: "center", paddingTop: "3xl" })}>No content available</div>
               )}
             </motion.div>
-
-            {/* Markdown TOC button */}
-            {mdToc.length > 0 && (
-              <div
-                className={css({
-                  position: "absolute", bottom: "16px", right: "16px",
-                  display: "flex", alignItems: "center", gap: "2px",
-                  bg: "rgba(10, 10, 12, 0.88)", backdropFilter: "blur(12px)",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                  borderRadius: "lg", padding: "2px",
-                  zIndex: 50,
-                })}
-              >
-                <ControlButton onClick={() => setMdTocOpen((v) => !v)} active={mdTocOpen} title="Table of contents">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M3 12h18M3 6h18M3 18h18" /></svg>
-                </ControlButton>
-              </div>
-            )}
-
-            {/* Markdown TOC drawer */}
-            <AnimatePresence>
-              {mdTocOpen && mdToc.length > 0 && (
-                <motion.div
-                  initial={{ opacity: 0, x: 40 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  exit={{ opacity: 0, x: 40 }}
-                  transition={{ type: "spring", stiffness: 400, damping: 30 }}
-                  className={css({
-                    position: "absolute", top: 0, right: 0, bottom: 0, width: "280px",
-                    bg: "rgba(10, 10, 12, 0.92)", backdropFilter: "blur(16px)",
-                    borderLeft: "1px solid rgba(255,255,255,0.06)",
-                    display: "flex", flexDirection: "column",
-                    zIndex: 60, overflow: "hidden",
-                  })}
-                >
-                  <div className={css({ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 16px", borderBottom: "1px solid rgba(255,255,255,0.06)" })}>
-                    <span className={css({ fontSize: "xs", fontWeight: 600, color: "text.muted", textTransform: "uppercase", letterSpacing: "0.05em" })}>
-                      Contents
-                    </span>
-                    <ControlButton onClick={() => setMdTocOpen(false)} title="Close">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M18 6L6 18M6 6l12 12" /></svg>
-                    </ControlButton>
-                  </div>
-                  <div className={css({ flex: 1, overflow: "auto", padding: "8px 0" })}>
-                    {mdToc.map((entry, i) => (
-                      <button
-                        key={i}
-                        onClick={() => {
-                          if (entry.href) {
-                            const el = document.getElementById(entry.href);
-                            el?.scrollIntoView({ behavior: "smooth", block: "start" });
-                          }
-                          setMdTocOpen(false);
-                        }}
-                        className={css({
-                          display: "block", width: "100%", textAlign: "left",
-                          bg: "transparent", border: "none",
-                          color: "text.secondary",
-                          fontSize: "sm", fontFamily: "body",
-                          padding: "6px 16px",
-                          cursor: "pointer", borderRadius: "sm", transition: "all 120ms",
-                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                          _hover: { bg: "bg.hover", color: "text.primary" },
-                        } as any)}
-                        style={{ paddingLeft: `${16 + (entry.level - 1) * 16}px` }}
-                      >
-                        {entry.title}
-                      </button>
-                    ))}
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
           </>
         ) : (
           <motion.div
@@ -941,12 +882,86 @@ export function DocumentView() {
         )}
       </div>
 
+      {/* Markdown TOC button — outside scrollable div so it stays fixed */}
+      {activeTab === "read" && mdToc.length > 0 && (
+        <div
+          className={css({
+            position: "absolute", bottom: "16px", right: "16px",
+            display: "flex", alignItems: "center", gap: "2px",
+            bg: "rgba(10, 10, 12, 0.88)", backdropFilter: "blur(12px)",
+            border: "1px solid rgba(255,255,255,0.08)",
+            borderRadius: "lg", padding: "2px",
+            zIndex: 50,
+          })}
+        >
+          <ControlButton onClick={() => setMdTocOpen((v) => !v)} active={mdTocOpen} title="Table of contents">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M3 12h18M3 6h18M3 18h18" /></svg>
+          </ControlButton>
+        </div>
+      )}
+
+      {/* Markdown TOC drawer — outside scrollable div so it stays fixed */}
+      <AnimatePresence>
+        {activeTab === "read" && mdTocOpen && mdToc.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, x: 40 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 40 }}
+            transition={{ type: "spring", stiffness: 400, damping: 30 }}
+            className={css({
+              position: "absolute", top: 0, right: 0, bottom: 0, width: "280px",
+              bg: "rgba(10, 10, 12, 0.92)", backdropFilter: "blur(16px)",
+              borderLeft: "1px solid rgba(255,255,255,0.06)",
+              display: "flex", flexDirection: "column",
+              zIndex: 60, overflow: "hidden",
+            })}
+          >
+            <div className={css({ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 16px", borderBottom: "1px solid rgba(255,255,255,0.06)" })}>
+              <span className={css({ fontSize: "xs", fontWeight: 600, color: "text.muted", textTransform: "uppercase", letterSpacing: "0.05em" })}>
+                Contents
+              </span>
+              <ControlButton onClick={() => setMdTocOpen(false)} title="Close">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M18 6L6 18M6 6l12 12" /></svg>
+              </ControlButton>
+            </div>
+            <div className={css({ flex: 1, overflow: "auto", padding: "8px 0" })}>
+              {mdToc.map((entry, i) => (
+                <button
+                  key={i}
+                  onClick={() => {
+                    if (entry.href) {
+                      const el = document.getElementById(entry.href);
+                      el?.scrollIntoView({ behavior: "smooth", block: "start" });
+                    }
+                    setMdTocOpen(false);
+                  }}
+                  className={css({
+                    display: "block", width: "100%", textAlign: "left",
+                    bg: "transparent", border: "none",
+                    color: "text.secondary",
+                    fontSize: "sm", fontFamily: "body",
+                    padding: "6px 16px",
+                    cursor: "pointer", borderRadius: "sm", transition: "all 120ms",
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    _hover: { bg: "bg.hover", color: "text.primary" },
+                  } as any)}
+                  style={{ paddingLeft: `${16 + (entry.level - 1) * 16}px` }}
+                >
+                  {entry.title}
+                </button>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Ask Panel */}
       <ChatPanel
         mode="document"
         documentId={id!}
         documentTitle={doc.title || "Untitled"}
         hasChunks={hasChunks}
+        onChunksCreated={() => setHasChunks(true)}
         isOpen={askOpen}
         onClose={() => setAskOpen(false)}
       />

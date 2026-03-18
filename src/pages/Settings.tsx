@@ -19,6 +19,8 @@ import {
   pullOllamaModel,
   deleteOllamaModel,
   formatFileSize,
+  getSystemHardware,
+  getModelFits,
 } from "../lib/api";
 import type {
   Settings as SettingsType,
@@ -29,6 +31,8 @@ import type {
   OllamaStatus,
   OllamaModelInfo,
   RecommendedModel,
+  HardwareInfo,
+  ModelFitInfo,
 } from "../lib/api";
 
 const MODELS = [
@@ -63,6 +67,9 @@ export function Settings() {
   const [customModelName, setCustomModelName] = useState("");
   const [pullingModel, setPullingModel] = useState<string | null>(null);
   const ollamaPollRef = useRef<ReturnType<typeof setInterval>>(undefined);
+  const [hardwareInfo, setHardwareInfo] = useState<HardwareInfo | null>(null);
+  const [modelFits, setModelFits] = useState<ModelFitInfo[]>([]);
+  const [useCaseFilter, setUseCaseFilter] = useState<string | null>(null);
 
   const refreshOllama = useCallback(() => {
     checkOllamaStatus().then((s) => {
@@ -72,7 +79,13 @@ export function Settings() {
       }
     }).catch(() => {});
     listRecommendedOllamaModels().then(setRecommendedModels).catch(() => {});
-  }, []);
+    getSystemHardware().then(setHardwareInfo).catch(() => {});
+    getModelFits(30, useCaseFilter ?? undefined).then(setModelFits).catch(() => {});
+  }, [useCaseFilter]);
+
+  useEffect(() => {
+    getModelFits(30, useCaseFilter ?? undefined).then(setModelFits).catch(() => {});
+  }, [useCaseFilter]);
 
   const refreshEmbedStats = useCallback(() => {
     getEmbeddingStats().then(setEmbedStats).catch(() => {});
@@ -618,7 +631,8 @@ export function Settings() {
               lineHeight: 1.5,
             })}
           >
-            Used for chat, summaries, and metadata enrichment
+            Used for chat, summaries, and metadata enrichment. Document
+            extraction (OCR, image-based formats) always uses Claude.
           </p>
 
           <div className={css({ display: "flex", gap: "sm", marginBottom: "md" })}>
@@ -738,6 +752,13 @@ export function Settings() {
                 </button>
               </div>
 
+              {/* Hardware info */}
+              {hardwareInfo && (
+                <div className={css({ fontSize: "xs", color: "text.muted", padding: "sm", bg: "bg.surface", borderRadius: "md", border: "1px solid", borderColor: "border.subtle" })}>
+                  {hardwareInfo.cpu_name} · {hardwareInfo.total_ram_gb.toFixed(0)} GB{hardwareInfo.unified_memory ? " unified" : ""} memory · {hardwareInfo.backend}
+                </div>
+              )}
+
               {ollamaStatus?.available && (
                 <>
                   {/* Installed models */}
@@ -792,6 +813,10 @@ export function Settings() {
                             </div>
                             <div className={css({ fontSize: "xs", color: "text.muted", marginTop: "1px" })}>
                               {m.parameter_size || ""}{m.parameter_size && m.family ? " · " : ""}{m.family || ""}{" · "}{formatFileSize(m.size)}
+                              {(() => {
+                                const fit = modelFits.find((f) => f.installed && (f.name.toLowerCase() === m.name.toLowerCase() || m.name.toLowerCase().startsWith(f.name.toLowerCase().split(":")[0])));
+                                return fit ? <>{" · "}<span style={{ color: fit.fit_level === "Perfect" ? "#34d399" : fit.fit_level === "Good" ? "#60a5fa" : "#fbbf24" }}>{fit.fit_level}</span>{" · "}{fit.estimated_tps.toFixed(0)} tok/s</> : null;
+                              })()}
                             </div>
                           </div>
                           <button
@@ -814,19 +839,44 @@ export function Settings() {
                     </div>
                   )}
 
-                  {/* Recommended models to pull */}
-                  {recommendedModels.filter(
-                    (r) => !ollamaModels.some((m) => m.name === r.name || m.name === r.name.split(":")[0] + ":latest")
-                  ).length > 0 && (
+                  {/* Recommended models (hardware-scored) */}
+                  {modelFits.length > 0 && (
                     <div className={css({ display: "flex", flexDirection: "column", gap: "sm" })}>
-                      <div className={css({ fontSize: "xs", fontWeight: 600, color: "text.muted", textTransform: "uppercase", letterSpacing: "0.05em" })}>
-                        Recommended Models
+                      <div className={css({ display: "flex", alignItems: "center", gap: "sm" })}>
+                        <div className={css({ fontSize: "xs", fontWeight: 600, color: "text.muted", textTransform: "uppercase", letterSpacing: "0.05em" })}>
+                          Recommended for Your Hardware
+                        </div>
                       </div>
-                      {recommendedModels
-                        .filter((r) => !ollamaModels.some((m) => m.name === r.name || m.name === r.name.split(":")[0] + ":latest"))
-                        .map((r) => (
+                      {/* Use case filter tabs */}
+                      <div className={css({ display: "flex", gap: "xs", flexWrap: "wrap" })}>
+                        {[null, "General", "Coding", "Reasoning", "Chat", "Multimodal"].map((uc) => (
+                          <button
+                            key={uc ?? "all"}
+                            onClick={() => setUseCaseFilter(uc)}
+                            className={css({
+                              fontSize: "xs",
+                              padding: "2px",
+                              paddingLeft: "sm",
+                              paddingRight: "sm",
+                              borderRadius: "sm",
+                              cursor: "pointer",
+                              bg: useCaseFilter === uc ? "accent.subtle" : "transparent",
+                              color: useCaseFilter === uc ? "accent.base" : "text.muted",
+                              border: "1px solid",
+                              borderColor: useCaseFilter === uc ? "accent.dim" : "transparent",
+                              _hover: { color: "text.primary" },
+                            } as any)}
+                          >
+                            {uc ?? "All"}
+                          </button>
+                        ))}
+                      </div>
+                      {modelFits
+                        .filter((f) => !f.installed)
+                        .slice(0, 12)
+                        .map((f) => (
                           <div
-                            key={r.name}
+                            key={f.name}
                             className={css({
                               display: "flex",
                               alignItems: "center",
@@ -839,29 +889,50 @@ export function Settings() {
                               borderRadius: "md",
                             })}
                           >
-                            <div className={css({ flex: 1 })}>
-                              <div className={css({ fontSize: "sm", fontWeight: 500, color: "text.secondary" })}>
-                                {r.label}
+                            <div className={css({
+                              width: "8px",
+                              height: "8px",
+                              borderRadius: "full",
+                              flexShrink: 0,
+                              bg: f.fit_level === "Perfect" ? "#34d399" : f.fit_level === "Good" ? "#60a5fa" : "#fbbf24",
+                            })} />
+                            <div className={css({ flex: 1, minWidth: 0 })}>
+                              <div className={css({ display: "flex", alignItems: "center", gap: "sm" })}>
+                                <span className={css({ fontSize: "sm", fontWeight: 500, color: "text.primary" })}>
+                                  {f.name}
+                                </span>
+                                <span className={css({ fontSize: "xs", color: "text.muted" })}>
+                                  {f.parameter_count}
+                                </span>
                               </div>
-                              <div className={css({ fontSize: "xs", color: "text.muted", marginTop: "1px" })}>
-                                {r.description}
+                              <div className={css({ fontSize: "xs", color: "text.muted", marginTop: "1px", display: "flex", gap: "sm", flexWrap: "wrap" })}>
+                                <span>{f.use_case}</span>
+                                <span>·</span>
+                                <span>{Math.round(f.score)}/100</span>
+                                <span>·</span>
+                                <span>{f.estimated_tps.toFixed(0)} tok/s</span>
+                                <span>·</span>
+                                <span>{f.memory_required_gb.toFixed(1)} GB</span>
+                                <span>·</span>
+                                <span>{f.best_quant}</span>
                               </div>
                             </div>
                             <button
-                              onClick={() => handlePullModel(r.name)}
+                              onClick={() => handlePullModel(f.name)}
                               disabled={pullingModel !== null}
                               className={css({
                                 fontSize: "xs",
                                 fontWeight: 500,
-                                color: pullingModel === r.name ? "text.muted" : "accent.base",
+                                color: pullingModel === f.name ? "text.muted" : "accent.base",
                                 cursor: pullingModel !== null ? "default" : "pointer",
                                 padding: "xs",
                                 paddingLeft: "sm",
                                 paddingRight: "sm",
+                                flexShrink: 0,
                                 _hover: pullingModel !== null ? {} : { opacity: 0.8 },
                               } as any)}
                             >
-                              {pullingModel === r.name ? "Pulling..." : "Pull"}
+                              {pullingModel === f.name ? "Pulling..." : "Pull"}
                             </button>
                           </div>
                         ))}

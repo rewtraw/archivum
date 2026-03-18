@@ -1,6 +1,26 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+/// Extract JSON from a response that may contain thinking tags or other text.
+/// Tries: raw string → strip code fences → find first `{...}` block.
+fn extract_json(text: &str) -> &str {
+    let stripped = crate::claude::strip_code_fences(text);
+    if !stripped.trim().is_empty() && stripped.trim().starts_with('{') {
+        return stripped;
+    }
+
+    // Try to find JSON object within the text (skip <think> blocks, etc.)
+    if let Some(start) = text.find('{') {
+        if let Some(end) = text.rfind('}') {
+            if end > start {
+                return &text[start..=end];
+            }
+        }
+    }
+
+    stripped
+}
+
 pub struct OllamaClient {
     client: Client,
 }
@@ -206,21 +226,24 @@ impl OllamaClient {
             text_excerpt
         };
 
-        let prompt = format!(
-            "Here is an excerpt from a document:\n\n---\n{}\n---\n\n{}",
+        let user_msg = format!(
+            "Here is an excerpt from a document:\n\n---\n{}\n---\n\n{}\n\nRespond with ONLY the JSON object.",
             excerpt, crate::claude::METADATA_PROMPT
         );
 
-        let url = format!("{}/api/generate", base_url);
+        // Use /api/chat instead of /api/generate — handles thinking models (Qwen 3, etc.) better
+        let url = format!("{}/api/chat", base_url);
         let resp = self
             .client
             .post(&url)
             .json(&serde_json::json!({
                 "model": model,
-                "prompt": prompt,
+                "messages": [
+                    {"role": "user", "content": user_msg}
+                ],
                 "stream": false,
                 "format": "json",
-                "options": {"num_predict": 1024},
+                "options": {"num_predict": 2048, "num_ctx": 8192},
             }))
             .send()
             .await
@@ -236,13 +259,25 @@ impl OllamaClient {
             .await
             .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
 
-        let text = body["response"]
+        let text = body["message"]["content"]
             .as_str()
-            .ok_or_else(|| "No response text from Ollama".to_string())?;
+            .ok_or_else(|| format!("No message content from Ollama: {}", body))?;
 
-        let json_str = crate::claude::strip_code_fences(text);
+        if text.trim().is_empty() {
+            return Err("Ollama returned empty response for metadata".to_string());
+        }
+
+        let json_str = extract_json(text);
+
+        if json_str.trim().is_empty() {
+            return Err(format!(
+                "Ollama response contained no JSON (raw: {})",
+                &text[..text.len().min(200)]
+            ));
+        }
+
         serde_json::from_str::<crate::claude::MetadataResult>(json_str)
-            .map_err(|e| format!("Failed to parse metadata from Ollama: {}", e))
+            .map_err(|e| format!("Failed to parse metadata from Ollama: {} (raw: {})", e, &json_str[..json_str.len().min(200)]))
     }
 
     /// Generate a document summary (mirrors ClaudeClient::generate_summary)
@@ -273,18 +308,20 @@ impl OllamaClient {
             text
         };
 
-        let prompt = format!(
+        let user_msg = format!(
             "Here is a document:\n\n---\n{}\n---\n\n{}\n\nReturn ONLY the summary text, no preamble.",
             excerpt, instruction
         );
 
-        let url = format!("{}/api/generate", base_url);
+        let url = format!("{}/api/chat", base_url);
         let resp = self
             .client
             .post(&url)
             .json(&serde_json::json!({
                 "model": model,
-                "prompt": prompt,
+                "messages": [
+                    {"role": "user", "content": user_msg}
+                ],
                 "stream": false,
                 "options": {"num_predict": max_tokens},
             }))
@@ -302,10 +339,18 @@ impl OllamaClient {
             .await
             .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
 
-        body["response"]
+        let content = body["message"]["content"]
             .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| "No response text from Ollama".to_string())
+            .ok_or_else(|| "No message content from Ollama".to_string())?;
+
+        // Strip thinking tags if present
+        let result = if let Some(end) = content.find("</think>") {
+            content[end + 8..].trim()
+        } else {
+            content.trim()
+        };
+
+        Ok(result.to_string())
     }
 
     /// Stream a chat response with document context (mirrors ClaudeClient::chat_with_context)
@@ -359,11 +404,11 @@ impl OllamaClient {
         }
 
         let system_prompt = "You are a research assistant with access to the user's document library. \
-             You can see excerpts from MULTIPLE documents, each labeled with its source. \
+             You can see excerpts from MULTIPLE documents, each labeled with their source number and title. \
              Your job is to synthesize information ACROSS documents — find patterns, draw comparisons, \
              note agreements and contradictions between sources, and build a holistic answer. \
              Do NOT just answer from a single source when multiple are available. \
-             Always cite which document(s) you are drawing from. \
+             Always cite sources by their title (e.g. \"as discussed in *Title of Book*\"), NOT by number. \
              If the excerpts don't contain enough information, say so clearly.";
 
         let user_message = format!(

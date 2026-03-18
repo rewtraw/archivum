@@ -345,6 +345,14 @@ impl Database {
         Ok(count > 0)
     }
 
+    pub fn set_markdown_path(&self, id: &str, md_path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE documents SET markdown_path = ?1 WHERE id = ?2",
+            params![md_path, id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_document_metadata(
         &self,
         id: &str,
@@ -800,7 +808,18 @@ impl Database {
             .flat_map(|f| f.to_le_bytes())
             .collect();
 
-        // sqlite-vec requires k=? in the WHERE clause, not a LIMIT
+        // sqlite-vec MATCH returns the global top-k nearest neighbors.
+        // We need to fetch more than `limit` to account for chunks from other
+        // documents, then filter to the target document in the outer query.
+        let total_chunks: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunk_embeddings",
+            [],
+            |row| row.get(0),
+        )?;
+        // Fetch up to 200 or total chunks (whichever is smaller) to ensure
+        // we find enough results for this specific document.
+        let k = std::cmp::min(total_chunks, 200);
+
         let mut stmt = self.conn.prepare(
             "SELECT dc.content, dc.chunk_index, ce.distance
              FROM chunk_embeddings ce
@@ -808,11 +827,12 @@ impl Database {
              WHERE ce.embedding MATCH ?1
                AND ce.k = ?2
                AND dc.document_id = ?3
-             ORDER BY ce.distance",
+             ORDER BY ce.distance
+             LIMIT ?4",
         )?;
 
         let results = stmt
-            .query_map(params![embedding_bytes, limit as i64, document_id], |row| {
+            .query_map(params![embedding_bytes, k, document_id, limit as i64], |row| {
                 Ok(ChunkSearchResult {
                     content: row.get(0)?,
                     chunk_index: row.get::<_, i64>(1)? as usize,
@@ -995,7 +1015,7 @@ impl Database {
 
     pub fn get_embedding_stats(&self) -> Result<(i64, i64)> {
         let total: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM documents WHERE status = 'complete'",
+            "SELECT COUNT(*) FROM documents WHERE status = 'complete' AND markdown_path IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
@@ -1268,6 +1288,33 @@ impl Database {
     }
 
     // --- Tags ---
+
+    pub fn set_document_tags(&self, doc_id: &str, tags: &[String]) -> Result<()> {
+        // Clear existing tags for this document
+        self.conn.execute(
+            "DELETE FROM document_tags WHERE document_id = ?1",
+            params![doc_id],
+        )?;
+
+        for tag_name in tags {
+            let name = tag_name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            // Insert tag if it doesn't exist
+            self.conn.execute(
+                "INSERT OR IGNORE INTO tags (name) VALUES (?1)",
+                params![name],
+            )?;
+            // Link tag to document
+            self.conn.execute(
+                "INSERT OR IGNORE INTO document_tags (document_id, tag_id)
+                 SELECT ?1, id FROM tags WHERE name = ?2",
+                params![doc_id, name],
+            )?;
+        }
+        Ok(())
+    }
 
     pub fn list_all_tags(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(

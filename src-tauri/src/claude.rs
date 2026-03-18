@@ -98,10 +98,11 @@ pub const METADATA_PROMPT: &str = r#"You are a document metadata extractor. Base
   "publisher": "Publisher if found, null otherwise",
   "published_date": "Publication date if found, null otherwise",
   "page_count": null,
-  "tags": ["relevant", "topic", "tags"]
+  "tags": ["broad-category", "genre-or-field"]
 }
 
 IMPORTANT: title and author must ALWAYS be strings, never null.
+For tags: use 2-4 BROAD categories only (e.g. "philosophy", "science", "fiction", "history", "technology", "politics", "economics", "biography", "mathematics", "psychology"). Do NOT use narrow or specific tags.
 Return ONLY the JSON object, no other text."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -609,11 +610,11 @@ impl ClaudeClient {
         }
 
         let system_prompt = "You are a research assistant with access to the user's document library. \
-             You can see excerpts from MULTIPLE documents, each labeled with its source. \
+             You can see excerpts from MULTIPLE documents, each labeled with their source number and title. \
              Your job is to synthesize information ACROSS documents — find patterns, draw comparisons, \
              note agreements and contradictions between sources, and build a holistic answer. \
              Do NOT just answer from a single source when multiple are available. \
-             Always cite which document(s) you are drawing from. \
+             Always cite sources by their title (e.g. \"as discussed in *Title of Book*\"), NOT by number. \
              If the excerpts don't contain enough information, say so clearly.";
 
         let user_message = format!(

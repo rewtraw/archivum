@@ -30,6 +30,7 @@ interface ChatPanelProps {
   documentId?: string;
   documentTitle?: string;
   hasChunks?: boolean;
+  onChunksCreated?: () => void;
   fullHeight?: boolean;
 }
 
@@ -43,6 +44,7 @@ export function ChatPanel({
   documentId,
   documentTitle,
   hasChunks,
+  onChunksCreated,
   fullHeight = false,
 }: ChatPanelProps) {
   const navigate = useNavigate();
@@ -52,6 +54,7 @@ export function ChatPanel({
   const [isEmbedding, setIsEmbedding] = useState(false);
   const [showSources, setShowSources] = useState<number | null>(null);
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const [needsIndex, setNeedsIndex] = useState(false);
 
   // Resizable height (only used when !fullHeight)
   const [panelHeight, setPanelHeight] = useState<number | null>(null);
@@ -85,8 +88,8 @@ export function ChatPanel({
       if (!dragRef.current) return;
       e.preventDefault();
       const delta = dragRef.current.startY - e.clientY;
-      const maxH = window.innerHeight - 100;
-      const newH = Math.min(maxH, Math.max(MIN_HEIGHT, dragRef.current.startH + delta));
+      const containerH = panelRef.current?.parentElement?.clientHeight ?? window.innerHeight - 100;
+      const newH = Math.min(containerH, Math.max(MIN_HEIGHT, dragRef.current.startH + delta));
       setPanelHeight(newH);
     };
     const onMouseUp = () => {
@@ -163,13 +166,19 @@ export function ChatPanel({
     [activeSessionId, refreshSessions]
   );
 
+  const [embedError, setEmbedError] = useState<string | null>(null);
+
   const handleEmbed = useCallback(async () => {
     if (!documentId) return;
     setIsEmbedding(true);
+    setEmbedError(null);
     try {
       await reembedDocument(documentId);
-      window.location.reload();
-    } catch (e) {
+      onChunksCreated?.();
+      setNeedsIndex(false);
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : e?.message || "Indexing failed";
+      setEmbedError(msg);
       console.error("Embedding failed:", e);
     } finally {
       setIsEmbedding(false);
@@ -260,14 +269,19 @@ export function ChatPanel({
           ).catch(() => {});
           setIsStreaming(false);
           break;
-        case "error":
+        case "error": {
+          const msg = event.data.message || "Unknown error";
+          const isIndexError = msg.includes("hasn't been indexed") || msg.includes("No indexed content");
+          if (isIndexError && mode === "document") {
+            setNeedsIndex(true);
+          }
           setMessages((prev) => {
             const updated = [...prev];
             const last = updated[updated.length - 1];
             if (last.role === "assistant") {
               updated[updated.length - 1] = {
                 ...last,
-                content: `Error: ${event.data.message}`,
+                content: isIndexError ? "This document needs to be indexed before I can answer questions about it." : `Error: ${msg}`,
                 streaming: false,
               };
             }
@@ -275,6 +289,7 @@ export function ChatPanel({
           });
           setIsStreaming(false);
           break;
+        }
       }
     };
 
@@ -309,7 +324,7 @@ export function ChatPanel({
     : {
         bottom: 0,
         height: panelHeight ? `${panelHeight}px` : `${DEFAULT_HEIGHT_VH}vh`,
-        maxHeight: "calc(100vh - 100px)",
+        maxHeight: "100%",
       };
 
   return (
@@ -594,13 +609,18 @@ export function ChatPanel({
                   >
                     {isEmbedding ? "Indexing..." : "Generate index"}
                   </button>
+                  {embedError && (
+                    <p className={css({ fontSize: "xs", color: "status.error", textAlign: "center", maxWidth: "360px" })}>
+                      {embedError}
+                    </p>
+                  )}
                 </div>
               ) : (
                 <>
                   {/* Messages */}
                   <div
                     ref={scrollRef}
-                    className={css({
+                    className={`selectable ${css({
                       flex: 1,
                       overflow: "auto",
                       padding: "md",
@@ -608,7 +628,7 @@ export function ChatPanel({
                       display: "flex",
                       flexDirection: "column",
                       gap: "md",
-                    })}
+                    })}`}
                   >
                     {messages.length === 0 && (
                       <div
@@ -843,7 +863,48 @@ export function ChatPanel({
                     ))}
                   </div>
 
-                  {/* Input */}
+                  {/* Input or Index prompt */}
+                  {needsIndex ? (
+                    <div
+                      className={css({
+                        padding: "md",
+                        borderTop: "1px solid rgba(255,255,255,0.06)",
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "center",
+                        gap: "sm",
+                        flexShrink: 0,
+                      })}
+                    >
+                      <button
+                        onClick={() => { setNeedsIndex(false); handleEmbed(); }}
+                        disabled={isEmbedding}
+                        className={css({
+                          bg: "accent.subtle",
+                          color: "accent.bright",
+                          border: "1px solid",
+                          borderColor: "accent.dim",
+                          borderRadius: "md",
+                          padding: "sm",
+                          paddingLeft: "lg",
+                          paddingRight: "lg",
+                          fontSize: "sm",
+                          fontWeight: 500,
+                          cursor: "pointer",
+                          transition: "all 150ms",
+                          _hover: { bg: "accent.base", color: "text.inverse" },
+                          _disabled: { opacity: 0.5, cursor: "not-allowed" },
+                        } as any)}
+                      >
+                        {isEmbedding ? "Indexing..." : "Generate index"}
+                      </button>
+                      {embedError && (
+                        <p className={css({ fontSize: "xs", color: "status.error", textAlign: "center", maxWidth: "360px" })}>
+                          {embedError}
+                        </p>
+                      )}
+                    </div>
+                  ) : (
                   <div
                     className={css({
                       padding: "10px 16px 14px",
@@ -917,6 +978,7 @@ export function ChatPanel({
                       </svg>
                     </button>
                   </div>
+                  )}
                 </>
               )}
             </div>
