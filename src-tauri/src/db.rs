@@ -107,6 +107,33 @@ pub struct TocEntry {
     pub href: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionSummary {
+    pub id: i64,
+    pub document_id: String,
+    pub start_chunk: i32,
+    pub end_chunk: i32,
+    pub title: Option<String>,
+    pub summary: String,
+    pub key_concepts: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicCluster {
+    pub id: String,
+    pub label: String,
+    pub summary: Option<String>,
+    pub document_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibrarySummary {
+    pub summary: String,
+    pub themes: Option<String>,
+    pub document_count: i64,
+    pub updated_at: String,
+}
+
 impl Database {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -310,6 +337,46 @@ impl Database {
             "ALTER TABLE documents ADD COLUMN source_url TEXT",
             [],
         );
+
+        // Hierarchical summaries
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS section_summaries (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                start_chunk INTEGER NOT NULL,
+                end_chunk   INTEGER NOT NULL,
+                title       TEXT,
+                summary     TEXT NOT NULL,
+                key_concepts TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(document_id, start_chunk, end_chunk)
+            );
+            CREATE INDEX IF NOT EXISTS idx_section_summaries_doc ON section_summaries(document_id);
+
+            CREATE TABLE IF NOT EXISTS topic_clusters (
+                id          TEXT PRIMARY KEY,
+                label       TEXT NOT NULL,
+                summary     TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS topic_cluster_members (
+                cluster_id  TEXT NOT NULL REFERENCES topic_clusters(id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                PRIMARY KEY (cluster_id, document_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS library_summary (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                summary         TEXT NOT NULL,
+                themes          TEXT,
+                document_count  INTEGER NOT NULL,
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            ",
+        )?;
 
         Ok(())
     }
@@ -1416,5 +1483,208 @@ impl Database {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(messages)
+    }
+
+    // --- Section Summaries ---
+
+    pub fn insert_section_summaries(
+        &self,
+        document_id: &str,
+        sections: &[(i32, i32, Option<&str>, &str, Option<&str>)], // (start, end, title, summary, key_concepts)
+    ) -> Result<()> {
+        // Clear existing sections for this document
+        self.conn.execute(
+            "DELETE FROM section_summaries WHERE document_id = ?1",
+            params![document_id],
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO section_summaries (document_id, start_chunk, end_chunk, title, summary, key_concepts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+
+        for (start, end, title, summary, concepts) in sections {
+            stmt.execute(params![document_id, start, end, title, summary, concepts])?;
+        }
+        Ok(())
+    }
+
+    pub fn get_section_summaries(&self, document_id: &str) -> Result<Vec<SectionSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, document_id, start_chunk, end_chunk, title, summary, key_concepts
+             FROM section_summaries WHERE document_id = ?1
+             ORDER BY start_chunk ASC",
+        )?;
+        let results = stmt
+            .query_map(params![document_id], |row| {
+                Ok(SectionSummary {
+                    id: row.get(0)?,
+                    document_id: row.get(1)?,
+                    start_chunk: row.get(2)?,
+                    end_chunk: row.get(3)?,
+                    title: row.get(4)?,
+                    summary: row.get(5)?,
+                    key_concepts: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
+    pub fn has_section_summaries(&self, document_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM section_summaries WHERE document_id = ?1",
+            params![document_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Get chunks by document, ordered by index.
+    pub fn get_document_chunks(&self, document_id: &str) -> Result<Vec<(i32, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_index, content FROM document_chunks
+             WHERE document_id = ?1 ORDER BY chunk_index ASC",
+        )?;
+        let results = stmt
+            .query_map(params![document_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
+    /// Search chunks by document (for getting a representative chunk).
+    pub fn search_chunks_by_document(&self, document_id: &str, limit: usize) -> Result<Vec<ChunkSearchResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content, chunk_index FROM document_chunks
+             WHERE document_id = ?1 ORDER BY chunk_index ASC LIMIT ?2",
+        )?;
+        let results = stmt
+            .query_map(params![document_id, limit as i64], |row| {
+                Ok(ChunkSearchResult {
+                    content: row.get(0)?,
+                    chunk_index: row.get::<_, i64>(1)? as usize,
+                    distance: 0.0,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
+    // --- Topic Clusters ---
+
+    pub fn create_topic_cluster(&self, id: &str, label: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO topic_clusters (id, label, updated_at) VALUES (?1, ?2, datetime('now'))",
+            params![id, label],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_cluster_members(&self, cluster_id: &str, doc_ids: &[String]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM topic_cluster_members WHERE cluster_id = ?1",
+            params![cluster_id],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO topic_cluster_members (cluster_id, document_id) VALUES (?1, ?2)",
+        )?;
+        for doc_id in doc_ids {
+            stmt.execute(params![cluster_id, doc_id])?;
+        }
+        Ok(())
+    }
+
+    pub fn upsert_cluster_summary(&self, cluster_id: &str, summary: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE topic_clusters SET summary = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![cluster_id, summary],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_topic_clusters(&self) -> Result<Vec<TopicCluster>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tc.id, tc.label, tc.summary,
+                    (SELECT COUNT(*) FROM topic_cluster_members WHERE cluster_id = tc.id)
+             FROM topic_clusters tc ORDER BY tc.label",
+        )?;
+        let results = stmt
+            .query_map([], |row| {
+                Ok(TopicCluster {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    summary: row.get(2)?,
+                    document_count: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
+    pub fn get_cluster_document_ids(&self, cluster_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_id FROM topic_cluster_members WHERE cluster_id = ?1",
+        )?;
+        let results = stmt
+            .query_map(params![cluster_id], |row| row.get(0))?
+            .collect::<Result<Vec<String>>>()?;
+        Ok(results)
+    }
+
+    pub fn clear_topic_clusters(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM topic_cluster_members", [])?;
+        self.conn.execute("DELETE FROM topic_clusters", [])?;
+        Ok(())
+    }
+
+    // --- Library Summary ---
+
+    pub fn upsert_library_summary(&self, summary: &str, themes: Option<&str>, doc_count: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO library_summary (id, summary, themes, document_count, updated_at)
+             VALUES (1, ?1, ?2, ?3, datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET
+                summary = excluded.summary,
+                themes = excluded.themes,
+                document_count = excluded.document_count,
+                updated_at = datetime('now')",
+            params![summary, themes, doc_count],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_library_summary(&self) -> Result<Option<LibrarySummary>> {
+        let result = self.conn.query_row(
+            "SELECT summary, themes, document_count, updated_at FROM library_summary WHERE id = 1",
+            [],
+            |row| {
+                Ok(LibrarySummary {
+                    summary: row.get(0)?,
+                    themes: row.get(1)?,
+                    document_count: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        );
+        match result {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Get all document IDs and titles (for clustering).
+    pub fn list_document_ids_and_titles(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, author FROM documents WHERE status = 'complete' ORDER BY title",
+        )?;
+        let results = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(results)
     }
 }

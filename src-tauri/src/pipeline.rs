@@ -8,6 +8,17 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Dispatch metadata enrichment to the configured AI provider.
 async fn enrich_metadata_dispatch(
     text: &str,
@@ -1283,4 +1294,81 @@ pub async fn import_from_url(
         Some("Webpage imported"),
         embed_engine, None,
     )
+}
+
+/// Generate section summaries for a document after import.
+/// Groups chunks into sections of 4 and summarizes each with AI.
+pub async fn generate_section_summaries_async(
+    db: &Arc<Mutex<Database>>,
+    config: &Arc<Mutex<ConfigManager>>,
+    doc_id: &str,
+) -> Result<(), String> {
+    let chunks = {
+        let db_lock = db.lock().unwrap();
+        // Skip if already has section summaries
+        if db_lock.has_section_summaries(doc_id).unwrap_or(false) {
+            return Ok(());
+        }
+        db_lock.get_document_chunks(doc_id).map_err(|e| e.to_string())?
+    };
+
+    if chunks.len() < 2 {
+        return Ok(()); // Too few chunks to bother
+    }
+
+    let cfg = config.lock().unwrap().load();
+    let section_size = 4;
+    let mut sections = Vec::new();
+
+    for group in chunks.chunks(section_size) {
+        let start = group.first().unwrap().0;
+        let end = group.last().unwrap().0;
+        let combined_text: String = group.iter()
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let prompt = format!(
+            "Summarize the following text section in 2-3 sentences. \
+             Also extract 3-5 key concepts as a comma-separated list.\n\n\
+             Respond with JSON: {{\"title\": \"section title\", \"summary\": \"...\", \"key_concepts\": \"concept1, concept2, ...\"}}\n\n\
+             Text:\n{}\n\nRespond with ONLY the JSON.",
+            &combined_text[..floor_char_boundary(&combined_text, 6000)]
+        );
+
+        let result = if cfg.ai_provider == "ollama" {
+            let ollama = crate::ollama::OllamaClient::new();
+            ollama.generate_json(&cfg.ollama_base_url, &cfg.ollama_model, &prompt).await
+        } else {
+            let api_key = cfg.anthropic_api_key.as_deref().unwrap_or("");
+            if api_key.is_empty() {
+                return Ok(()); // No API key, skip silently
+            }
+            let claude = ClaudeClient::new();
+            claude.generate_json(api_key, &cfg.model, &prompt).await
+        };
+
+        match result {
+            Ok(json) => {
+                let title = json["title"].as_str().map(|s| s.to_string());
+                let summary = json["summary"].as_str().unwrap_or("").to_string();
+                let key_concepts = json["key_concepts"].as_str().map(|s| s.to_string());
+                sections.push((start, end, title, summary, key_concepts));
+            }
+            Err(e) => {
+                eprintln!("[pipeline] section summary failed for chunks {}-{}: {}", start, end, e);
+            }
+        }
+    }
+
+    if !sections.is_empty() {
+        let db_lock = db.lock().unwrap();
+        let section_refs: Vec<(i32, i32, Option<&str>, &str, Option<&str>)> = sections.iter()
+            .map(|(s, e, t, sum, c)| (*s, *e, t.as_deref(), sum.as_str(), c.as_deref()))
+            .collect();
+        db_lock.insert_section_summaries(doc_id, &section_refs)
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }

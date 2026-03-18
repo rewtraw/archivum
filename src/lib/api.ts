@@ -194,12 +194,15 @@ export interface SourceChunk {
 }
 
 export interface ChatEvent {
-  event: "token" | "done" | "error" | "context";
+  event: "token" | "done" | "error" | "context" | "toolCall" | "toolResult";
   data: {
     text?: string;
     full_text?: string;
     message?: string;
     chunks?: SourceChunk[];
+    tool?: string;
+    query?: string;
+    summary?: string;
   };
 }
 
@@ -540,6 +543,56 @@ export async function getModelFits(
     limit: limit ?? null,
     useCaseFilter: useCaseFilter ?? null,
   });
+}
+
+// --- Hierarchical Summaries ---
+
+export interface SectionSummary {
+  id: number;
+  document_id: string;
+  start_chunk: number;
+  end_chunk: number;
+  title: string | null;
+  summary: string;
+  key_concepts: string | null;
+}
+
+export interface TopicCluster {
+  id: string;
+  label: string;
+  summary: string | null;
+  document_count: number;
+}
+
+export interface LibrarySummary {
+  summary: string;
+  themes: string | null;
+  document_count: number;
+  updated_at: string;
+}
+
+export async function generateSectionSummaries(
+  documentId: string
+): Promise<SectionSummary[]> {
+  return invoke("generate_section_summaries", { documentId });
+}
+
+export async function getSectionSummaries(
+  documentId: string
+): Promise<SectionSummary[]> {
+  return invoke("get_section_summaries", { documentId });
+}
+
+export async function getTopicClusters(): Promise<TopicCluster[]> {
+  return invoke("get_topic_clusters");
+}
+
+export async function getLibraryOverview(): Promise<LibrarySummary | null> {
+  return invoke("get_library_overview");
+}
+
+export async function refreshLibrarySummary(): Promise<string> {
+  return invoke("refresh_library_summary");
 }
 
 export function formatDuration(seconds: number): string {

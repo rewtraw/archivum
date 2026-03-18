@@ -21,6 +21,7 @@ interface ChatMessage {
   content: string;
   sources?: SourceChunk[];
   streaming?: boolean;
+  toolActivity?: string;
 }
 
 interface ChatPanelProps {
@@ -268,6 +269,40 @@ export function ChatPanel({
             collectedSources ? JSON.stringify(collectedSources) : undefined
           ).catch(() => {});
           setIsStreaming(false);
+          break;
+        case "toolCall":
+          setMessages((prev) => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            if (last.role === "assistant") {
+              const toolName = event.data.tool || "tool";
+              const labels: Record<string, string> = {
+                search_content: "Searching",
+                get_document_summary: "Reading summary",
+                get_section_summaries: "Scanning sections",
+                keyword_search: "Keyword search",
+                list_documents: "Listing documents",
+                get_related_documents: "Finding related",
+              };
+              const label = labels[toolName] || toolName;
+              const q = event.data.query ? `: ${event.data.query}` : "";
+              updated[updated.length - 1] = {
+                ...last,
+                toolActivity: `${label}${q}`,
+              };
+            }
+            return updated;
+          });
+          break;
+        case "toolResult":
+          setMessages((prev) => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            if (last.role === "assistant") {
+              updated[updated.length - 1] = { ...last, toolActivity: undefined };
+            }
+            return updated;
+          });
           break;
         case "error": {
           const msg = event.data.message || "Unknown error";
@@ -737,6 +772,29 @@ export function ChatPanel({
                               >
                                 <ReactMarkdown>{msg.content}</ReactMarkdown>
                               </div>
+                            )}
+                            {msg.toolActivity && (
+                              <motion.div
+                                initial={{ opacity: 0, height: 0 }}
+                                animate={{ opacity: 1, height: "auto" }}
+                                exit={{ opacity: 0, height: 0 }}
+                                className={css({
+                                  fontSize: "xs",
+                                  color: "text.muted",
+                                  fontStyle: "italic",
+                                  display: "flex",
+                                  alignItems: "center",
+                                  gap: "xs",
+                                  marginTop: "xs",
+                                })}
+                              >
+                                <motion.span
+                                  animate={{ opacity: [0.4, 1, 0.4] }}
+                                  transition={{ duration: 1.2, repeat: Infinity }}
+                                >
+                                  {msg.toolActivity}
+                                </motion.span>
+                              </motion.div>
                             )}
                             {msg.streaming && (
                               <motion.span

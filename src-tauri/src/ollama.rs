@@ -482,6 +482,47 @@ impl OllamaClient {
 
         Ok(full_text)
     }
+
+    /// Generate a JSON response from a prompt (non-streaming).
+    pub async fn generate_json(
+        &self,
+        base_url: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!("{}/api/chat", base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": false,
+                "format": "json",
+                "options": {"num_predict": 2048},
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Ollama request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Ollama error: {}", body));
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
+
+        let text = body["message"]["content"]
+            .as_str()
+            .ok_or_else(|| "No content from Ollama".to_string())?;
+
+        let json_str = extract_json(text);
+        serde_json::from_str(json_str)
+            .map_err(|e| format!("Failed to parse JSON from Ollama: {} (raw: {})", e, &json_str[..json_str.len().min(300)]))
+    }
 }
 
 impl Default for OllamaClient {

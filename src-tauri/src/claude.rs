@@ -500,190 +500,6 @@ impl ClaudeClient {
             .map_err(|e| format!("Failed to parse metadata: {}", e))
     }
 
-    /// Stream a RAG chat response using retrieved context chunks.
-    pub async fn chat_with_context(
-        &self,
-        question: &str,
-        context_chunks: &[crate::db::ChunkSearchResult],
-        document_title: &str,
-        api_key: &str,
-        model: &str,
-        channel: tauri::ipc::Channel<crate::commands::ChatEvent>,
-    ) -> Result<String, String> {
-        let mut context = String::new();
-        for (i, chunk) in context_chunks.iter().enumerate() {
-            context.push_str(&format!("[{}] {}\n\n", i + 1, chunk.content));
-        }
-
-        let system_prompt = format!(
-            "You are a helpful assistant answering questions about the document \"{}\". \
-             Use ONLY the following excerpts to answer. If the excerpts don't contain enough \
-             information, say so clearly. Quote relevant passages when helpful. Be concise but thorough.",
-            document_title
-        );
-
-        let user_message = format!(
-            "Here are relevant excerpts from the document:\n\n{}\nQuestion: {}",
-            context, question
-        );
-
-        let request = serde_json::json!({
-            "model": model,
-            "max_tokens": 4096,
-            "stream": true,
-            "system": system_prompt,
-            "messages": [{
-                "role": "user",
-                "content": user_message
-            }]
-        });
-
-        let response = self
-            .client
-            .post(CLAUDE_API_URL)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| format!("Chat request failed: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("Claude API error ({}): {}", status, body));
-        }
-
-        use futures_util::StreamExt;
-        let mut stream = response.bytes_stream();
-        let mut full_text = String::new();
-        let mut buffer = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|e| format!("Stream error: {}", e))?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-            // Process complete SSE lines
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].trim_end().to_string();
-                buffer = buffer[line_end + 1..].to_string();
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                        if event["type"] == "content_block_delta" {
-                            if let Some(text) = event["delta"]["text"].as_str() {
-                                full_text.push_str(text);
-                                let _ = channel.send(crate::commands::ChatEvent::Token {
-                                    text: text.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(full_text)
-    }
-
-    /// Stream a library-wide RAG chat response.
-    pub async fn chat_with_library_context(
-        &self,
-        question: &str,
-        context_chunks: &[crate::db::LibraryChunkResult],
-        api_key: &str,
-        model: &str,
-        channel: tauri::ipc::Channel<crate::commands::ChatEvent>,
-    ) -> Result<String, String> {
-        let mut context = String::new();
-        for (i, chunk) in context_chunks.iter().enumerate() {
-            context.push_str(&format!(
-                "[{} — \"{}\"] {}\n\n",
-                i + 1,
-                chunk.document_title,
-                chunk.content
-            ));
-        }
-
-        let system_prompt = "You are a research assistant with access to the user's document library. \
-             You can see excerpts from MULTIPLE documents, each labeled with their source number and title. \
-             Your job is to synthesize information ACROSS documents — find patterns, draw comparisons, \
-             note agreements and contradictions between sources, and build a holistic answer. \
-             Do NOT just answer from a single source when multiple are available. \
-             Always cite sources by their title (e.g. \"as discussed in *Title of Book*\"), NOT by number. \
-             If the excerpts don't contain enough information, say so clearly.";
-
-        let user_message = format!(
-            "Here are relevant excerpts from across your library:\n\n{}\nQuestion: {}",
-            context, question
-        );
-
-        let request = serde_json::json!({
-            "model": model,
-            "max_tokens": 8192,
-            "stream": true,
-            "system": system_prompt,
-            "messages": [{
-                "role": "user",
-                "content": user_message
-            }]
-        });
-
-        let response = self
-            .client
-            .post(CLAUDE_API_URL)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| format!("Chat request failed: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("Claude API error ({}): {}", status, body));
-        }
-
-        use futures_util::StreamExt;
-        let mut stream = response.bytes_stream();
-        let mut full_text = String::new();
-        let mut buffer = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|e| format!("Stream error: {}", e))?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].trim_end().to_string();
-                buffer = buffer[line_end + 1..].to_string();
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                        if event["type"] == "content_block_delta" {
-                            if let Some(text) = event["delta"]["text"].as_str() {
-                                full_text.push_str(text);
-                                let _ = channel.send(crate::commands::ChatEvent::Token {
-                                    text: text.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(full_text)
-    }
-
     /// Generate a document summary at the specified length.
     pub async fn generate_summary(
         &self,
@@ -753,5 +569,56 @@ impl ClaudeClient {
             .into_iter()
             .find_map(|c| c.text)
             .ok_or_else(|| "No text in response".to_string())
+    }
+
+    /// Generate a JSON response from a prompt (non-streaming).
+    pub async fn generate_json(
+        &self,
+        api_key: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Result<serde_json::Value, String> {
+        let request = ApiRequest {
+            model: model.to_string(),
+            max_tokens: 2048,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: prompt.to_string(),
+                }],
+            }],
+        };
+
+        let response = self
+            .client
+            .post(CLAUDE_API_URL)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format!("API request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Claude API error ({}): {}", status, body));
+        }
+
+        let api_response: ApiResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        let text = api_response
+            .content
+            .into_iter()
+            .find_map(|c| c.text)
+            .ok_or_else(|| "No text in response".to_string())?;
+
+        let json_str = strip_code_fences(&text);
+        serde_json::from_str(json_str)
+            .map_err(|e| format!("Failed to parse JSON: {} (raw: {})", e, &json_str[..json_str.len().min(300)]))
     }
 }

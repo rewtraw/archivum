@@ -1,3 +1,4 @@
+mod agent;
 mod claude;
 mod commands;
 mod config;
@@ -116,6 +117,11 @@ pub fn run() {
             commands::list_recommended_ollama_models,
             commands::get_system_hardware,
             commands::get_model_fits,
+            commands::generate_section_summaries,
+            commands::get_section_summaries,
+            commands::get_topic_clusters,
+            commands::get_library_overview,
+            commands::refresh_library_summary,
             commands::pull_ollama_model,
             commands::delete_ollama_model,
         ])

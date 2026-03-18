@@ -16,6 +16,8 @@ import {
   getDocumentToc,
   generateSummary,
   getAllSummaries,
+  getSectionSummaries,
+  generateSectionSummaries,
   getOriginalBytes,
   getOriginalPath,
   getMobiHtml,
@@ -24,7 +26,7 @@ import {
   formatDate,
   formatDuration,
 } from "../lib/api";
-import type { Document, SearchResult, TocEntry } from "../lib/api";
+import type { Document, SearchResult, TocEntry, SectionSummary } from "../lib/api";
 import { ChatPanel } from "../components/ChatPanel";
 
 const NATIVE_VIEWER_FORMATS = ["pdf", "epub", "mobi"];
@@ -255,6 +257,11 @@ export function DocumentView() {
   const [summaryLength, setSummaryLength] = useState<string>("short");
   const [summaryLoading, setSummaryLoading] = useState(false);
 
+  // Section summaries
+  const [sections, setSections] = useState<SectionSummary[]>([]);
+  const [sectionsLoading, setSectionsLoading] = useState(false);
+  const [sectionsExpanded, setSectionsExpanded] = useState(false);
+
   const hasNativeViewer = doc && NATIVE_VIEWER_FORMATS.includes(doc.original_format);
   const isEpub = doc?.original_format === "epub";
   const isMobi = doc?.original_format === "mobi";
@@ -288,6 +295,7 @@ export function DocumentView() {
           for (const [len, content] of pairs) map[len] = content;
           setSummaries(map);
         }).catch(() => {});
+        getSectionSummaries(id!).then(setSections).catch(() => {});
       } catch (e) {
         console.error("Failed to load document:", e);
       } finally {
@@ -842,6 +850,81 @@ export function DocumentView() {
                 <p className={css({ fontSize: "xs", color: "text.muted", marginTop: "sm" })}>
                   Click a length to generate a summary with Claude
                 </p>
+              )}
+            </div>
+
+            {/* Section Summaries */}
+            <div className={css({ marginTop: "lg" })}>
+              <div className={css({ display: "flex", alignItems: "center", gap: "sm" })}>
+                <span className={css({ fontSize: "sm", color: "text.muted" })}>Sections</span>
+                {sections.length === 0 && !sectionsLoading && (
+                  <button
+                    onClick={async () => {
+                      setSectionsLoading(true);
+                      try {
+                        const result = await generateSectionSummaries(id!);
+                        setSections(result);
+                      } catch (e) {
+                        console.error("Section generation failed:", e);
+                      }
+                      setSectionsLoading(false);
+                    }}
+                    className={css({
+                      fontSize: "xs",
+                      color: "accent.base",
+                      cursor: "pointer",
+                      _hover: { opacity: 0.8 },
+                    } as any)}
+                  >
+                    Generate
+                  </button>
+                )}
+                {sections.length > 0 && (
+                  <button
+                    onClick={() => setSectionsExpanded(!sectionsExpanded)}
+                    className={css({
+                      fontSize: "xs",
+                      color: "text.muted",
+                      cursor: "pointer",
+                      _hover: { color: "text.primary" },
+                    } as any)}
+                  >
+                    {sectionsExpanded ? "Collapse" : `Show ${sections.length}`}
+                  </button>
+                )}
+              </div>
+              {sectionsLoading && (
+                <p className={css({ fontSize: "xs", color: "text.muted", marginTop: "sm", fontStyle: "italic" })}>
+                  Generating section summaries...
+                </p>
+              )}
+              {sectionsExpanded && sections.length > 0 && (
+                <div className={css({ display: "flex", flexDirection: "column", gap: "sm", marginTop: "sm" })}>
+                  {sections.map((s) => (
+                    <div
+                      key={s.id}
+                      className={css({
+                        padding: "sm",
+                        bg: "bg.surface",
+                        borderRadius: "md",
+                        border: "1px solid",
+                        borderColor: "border.subtle",
+                      })}
+                    >
+                      <div className={css({ fontSize: "xs", fontWeight: 600, color: "text.primary" })}>
+                        {s.title || `Chunks ${s.start_chunk}-${s.end_chunk}`}
+                      </div>
+                      <div className={css({ fontSize: "xs", color: "text.secondary", marginTop: "2px", lineHeight: 1.5 })}>
+                        {s.summary}
+                      </div>
+                      {s.key_concepts && (
+                        <div className={css({ fontSize: "xs", color: "text.muted", marginTop: "xs" })}>
+                          {s.key_concepts}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
 

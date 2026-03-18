@@ -4,6 +4,18 @@ use crate::AppState;
 use std::path::PathBuf;
 use tauri::State;
 
+/// Find the largest byte index <= `max` that is a char boundary.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 #[derive(serde::Serialize)]
 pub struct ImportResult {
     pub document_id: String,
@@ -61,7 +73,10 @@ pub async fn import_files(
                 let tid = task_id.clone();
                 let did = doc_id.clone();
 
-                std::thread::spawn(move || {
+                std::thread::spawn({
+                    let config2 = config.clone();
+                    let db2 = db.clone();
+                    move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     let result = if crate::whisper::is_media_format(ext) {
@@ -73,10 +88,16 @@ pub async fn import_files(
                             &db, &storage, &claude, &config, &file_path, &tid, &did, &embeddings,
                         ))
                     };
-                    if let Err(e) = result {
+                    if let Err(e) = &result {
                         eprintln!("[archivum] import error: {}", e);
                     }
-                });
+                    // Post-import: generate section summaries (non-fatal)
+                    if result.is_ok() {
+                        if let Err(e) = rt.block_on(pipeline::generate_section_summaries_async(&db2, &config2, &did)) {
+                            eprintln!("[pipeline] section summary generation failed: {}", e);
+                        }
+                    }
+                }});
 
                 results.push(ImportResult {
                     document_id: doc_id,
@@ -110,7 +131,10 @@ pub async fn import_files(
             let tid = task_id.clone();
             let did = doc_id.clone();
 
-            std::thread::spawn(move || {
+            std::thread::spawn({
+                let config2 = config.clone();
+                let db2 = db.clone();
+                move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 let result = if crate::whisper::is_media_format(ext) {
@@ -122,10 +146,16 @@ pub async fn import_files(
                         &db, &storage, &claude, &config, &file_path, &tid, &did, &embeddings,
                     ))
                 };
-                if let Err(e) = result {
+                if let Err(e) = &result {
                     eprintln!("[archivum] import error: {}", e);
                 }
-            });
+                // Post-import: generate section summaries (non-fatal)
+                if result.is_ok() {
+                    if let Err(e) = rt.block_on(pipeline::generate_section_summaries_async(&db2, &config2, &did)) {
+                        eprintln!("[pipeline] section summary generation failed: {}", e);
+                    }
+                }
+            }});
 
             results.push(ImportResult {
                 document_id: doc_id,
@@ -496,6 +526,10 @@ pub enum ChatEvent {
     Error { message: String },
     #[serde(rename = "context")]
     Context { chunks: Vec<ContextChunk> },
+    #[serde(rename = "toolCall")]
+    ToolCall { tool: String, query: String },
+    #[serde(rename = "toolResult")]
+    ToolResult { tool: String, summary: String },
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -519,73 +553,64 @@ pub async fn ask_document(
     let cfg = state.config.lock().unwrap().load();
     let provider = cfg.ai_provider.clone();
 
-    let title = {
+    let (title, has_chunks_val) = {
         let db = state.db.lock().unwrap();
         let doc = db
             .get_document(&document_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "Document not found".to_string())?;
-        doc.title.clone()
+        let hc = db.has_chunks(&document_id).unwrap_or(false);
+        (doc.title.clone(), hc)
     };
 
-    // Embed the query
-    let data_dir = state.storage.originals_dir().parent().unwrap().to_path_buf();
-    let engine = state
-        .embeddings
-        .get_or_try_init(|| async {
-            crate::embeddings::EmbeddingEngine::new(&data_dir.join("models"))
-        })
-        .await
-        .map_err(|e| format!("Embedding engine failed: {}", e))?;
-
-    let query_embedding = engine.embed_query(&question)?;
-
-    // Search for relevant chunks
-    let chunks = {
-        let db = state.db.lock().unwrap();
-        db.search_chunks(&query_embedding, &document_id, 6)
-            .map_err(|e| e.to_string())?
-    };
-
-    if chunks.is_empty() {
+    if !has_chunks_val {
         let _ = on_token.send(ChatEvent::Error {
             message: "This document hasn't been indexed yet. Close the chat and click \"Generate index\" first.".to_string(),
         });
         return Ok(());
     }
 
-    // Send context info
-    let _ = on_token.send(ChatEvent::Context {
-        chunks: chunks
-            .iter()
-            .map(|c| ContextChunk {
-                content: c.content.clone(),
-                chunk_index: c.chunk_index,
-                distance: c.distance,
-                document_id: None,
-                document_title: None,
-            })
-            .collect(),
-    });
+    // Build summary context from document summary + section summaries
+    let summary_context = {
+        let db = state.db.lock().unwrap();
+        let mut ctx = String::new();
+        if let Ok(Some(summary)) = db.get_summary(&document_id, "medium") {
+            ctx.push_str(&format!("Document summary: {}\n\n", summary));
+        }
+        let sections = db.get_section_summaries(&document_id).unwrap_or_default();
+        if !sections.is_empty() {
+            ctx.push_str("Sections:\n");
+            for s in &sections {
+                let title_part = s.title.as_deref().unwrap_or("Untitled");
+                ctx.push_str(&format!("- {} (chunks {}-{}): {}\n", title_part, s.start_chunk, s.end_chunk, s.summary));
+            }
+        }
+        ctx
+    };
 
-    // Stream chat response — dispatch on provider
+    let scope = crate::agent::AgentScope::Document {
+        document_id: document_id.clone(),
+        title: title.clone(),
+    };
+    let data_dir = state.storage.originals_dir().parent().unwrap().to_path_buf();
+
     let result = if provider == "ollama" {
-        let ollama = crate::ollama::OllamaClient::new();
-        ollama
-            .chat_with_context(
-                &question, &chunks, &title,
-                &cfg.ollama_base_url, &cfg.ollama_model,
-                on_token.clone(),
-            )
-            .await
+        crate::agent::run_ollama_agent(
+            &question, scope, &summary_context,
+            &state.db, &state.embeddings, &data_dir,
+            &cfg.ollama_base_url, &cfg.ollama_model,
+            &on_token,
+        ).await
     } else {
         let api_key = cfg.anthropic_api_key
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "No API key configured. Add your Anthropic API key in Settings.".to_string())?;
-        let claude = crate::claude::ClaudeClient::new();
-        claude
-            .chat_with_context(&question, &chunks, &title, &api_key, &cfg.model, on_token.clone())
-            .await
+        crate::agent::run_claude_agent(
+            &question, scope, &summary_context,
+            &state.db, &state.embeddings, &data_dir,
+            &api_key, &cfg.model,
+            &on_token,
+        ).await
     };
 
     match result {
@@ -1115,7 +1140,7 @@ pub async fn list_tags(
 /// Select chunks with diversity across documents.
 /// Fetches a large candidate pool, then round-robins across unique documents
 /// to ensure the context covers multiple sources.
-fn diversify_chunks(
+pub fn diversify_chunks(
     candidates: Vec<crate::db::LibraryChunkResult>,
     budget: usize,
 ) -> Vec<crate::db::LibraryChunkResult> {
@@ -1172,63 +1197,48 @@ pub async fn ask_library(
     let cfg = state.config.lock().unwrap().load();
     let provider = cfg.ai_provider.clone();
 
-    let data_dir = state.storage.originals_dir().parent().unwrap().to_path_buf();
-    let engine = state
-        .embeddings
-        .get_or_try_init(|| async {
-            crate::embeddings::EmbeddingEngine::new(&data_dir.join("models"))
-        })
-        .await
-        .map_err(|e| format!("Embedding engine failed: {}", e))?;
-
-    let query_embedding = engine.embed_query(&question)?;
-
-    // Fetch a large candidate pool, then diversify across documents
-    let candidates = {
+    // Build summary context from library summary + topic clusters
+    let summary_context = {
         let db = state.db.lock().unwrap();
-        db.search_all_chunks(&query_embedding, 40)
-            .map_err(|e| e.to_string())?
+        let mut ctx = String::new();
+        if let Ok(Some(lib_summary)) = db.get_library_summary() {
+            ctx.push_str(&format!("Library overview ({} documents): {}\n", lib_summary.document_count, lib_summary.summary));
+            if let Some(themes) = &lib_summary.themes {
+                ctx.push_str(&format!("Themes: {}\n", themes));
+            }
+            ctx.push('\n');
+        }
+        let clusters = db.get_topic_clusters().unwrap_or_default();
+        if !clusters.is_empty() {
+            ctx.push_str("Topic clusters:\n");
+            for c in &clusters {
+                let summary = c.summary.as_deref().unwrap_or("(no summary)");
+                ctx.push_str(&format!("- {} ({} docs): {}\n", c.label, c.document_count, summary));
+            }
+        }
+        ctx
     };
 
-    if candidates.is_empty() {
-        let _ = on_token.send(ChatEvent::Error {
-            message: "No indexed content found. Import some documents first.".to_string(),
-        });
-        return Ok(());
-    }
-
-    let chunks = diversify_chunks(candidates, 15);
-
-    let _ = on_token.send(ChatEvent::Context {
-        chunks: chunks
-            .iter()
-            .map(|c| ContextChunk {
-                content: c.content.clone(),
-                chunk_index: c.chunk_index,
-                distance: c.distance,
-                document_id: Some(c.document_id.clone()),
-                document_title: Some(c.document_title.clone()),
-            })
-            .collect(),
-    });
+    let scope = crate::agent::AgentScope::Library;
+    let data_dir = state.storage.originals_dir().parent().unwrap().to_path_buf();
 
     let result = if provider == "ollama" {
-        let ollama = crate::ollama::OllamaClient::new();
-        ollama
-            .chat_with_library_context(
-                &question, &chunks,
-                &cfg.ollama_base_url, &cfg.ollama_model,
-                on_token.clone(),
-            )
-            .await
+        crate::agent::run_ollama_agent(
+            &question, scope, &summary_context,
+            &state.db, &state.embeddings, &data_dir,
+            &cfg.ollama_base_url, &cfg.ollama_model,
+            &on_token,
+        ).await
     } else {
         let api_key = cfg.anthropic_api_key
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "No API key configured. Add your Anthropic API key in Settings.".to_string())?;
-        let claude = crate::claude::ClaudeClient::new();
-        claude
-            .chat_with_library_context(&question, &chunks, &api_key, &cfg.model, on_token.clone())
-            .await
+        crate::agent::run_claude_agent(
+            &question, scope, &summary_context,
+            &state.db, &state.embeddings, &data_dir,
+            &api_key, &cfg.model,
+            &on_token,
+        ).await
     };
 
     match result {
@@ -1701,4 +1711,193 @@ pub async fn delete_ollama_model(
     let base_url = state.config.lock().unwrap().load().ollama_base_url;
     let client = crate::ollama::OllamaClient::new();
     client.delete_model(&base_url, &name).await
+}
+
+// --- Hierarchical Summaries ---
+
+#[tauri::command]
+pub async fn generate_section_summaries(
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::db::SectionSummary>, String> {
+    let cfg = state.config.lock().unwrap().load();
+
+    // Get all chunks for this document
+    let chunks = {
+        let db = state.db.lock().unwrap();
+        db.get_document_chunks(&document_id).map_err(|e| e.to_string())?
+    };
+
+    if chunks.is_empty() {
+        return Err("No chunks found. Index the document first.".to_string());
+    }
+
+    // Group chunks into sections of 4
+    let section_size = 4;
+    let mut sections = Vec::new();
+
+    for group in chunks.chunks(section_size) {
+        let start = group.first().unwrap().0;
+        let end = group.last().unwrap().0;
+        let combined_text: String = group.iter()
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let prompt = format!(
+            "Summarize the following text section in 2-3 sentences. \
+             Also extract 3-5 key concepts as a comma-separated list.\n\n\
+             Respond with JSON: {{\"title\": \"section title\", \"summary\": \"...\", \"key_concepts\": \"concept1, concept2, ...\"}}\n\n\
+             Text:\n{}\n\nRespond with ONLY the JSON.",
+            &combined_text[..floor_char_boundary(&combined_text, 6000)]
+        );
+
+        let result = if cfg.ai_provider == "ollama" {
+            let ollama = crate::ollama::OllamaClient::new();
+            ollama.generate_json(&cfg.ollama_base_url, &cfg.ollama_model, &prompt).await
+        } else {
+            let api_key = cfg.anthropic_api_key.as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "No API key configured".to_string())?;
+            let claude = crate::claude::ClaudeClient::new();
+            claude.generate_json(api_key, &cfg.model, &prompt).await
+        };
+
+        match result {
+            Ok(json) => {
+                let title = json["title"].as_str().map(|s| s.to_string());
+                let summary = json["summary"].as_str().unwrap_or("").to_string();
+                let key_concepts = json["key_concepts"].as_str().map(|s| s.to_string());
+                sections.push((start, end, title, summary, key_concepts));
+            }
+            Err(e) => {
+                eprintln!("[sections] Failed to summarize chunks {}-{}: {}", start, end, e);
+                sections.push((start, end, None, combined_text[..floor_char_boundary(&combined_text, 200)].to_string(), None));
+            }
+        }
+    }
+
+    // Store in database
+    {
+        let db = state.db.lock().unwrap();
+        let section_refs: Vec<(i32, i32, Option<&str>, &str, Option<&str>)> = sections.iter()
+            .map(|(s, e, t, sum, c)| (*s, *e, t.as_deref(), sum.as_str(), c.as_deref()))
+            .collect();
+        db.insert_section_summaries(&document_id, &section_refs)
+            .map_err(|e| e.to_string())?;
+    }
+
+    let db = state.db.lock().unwrap();
+    db.get_section_summaries(&document_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_section_summaries(
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::db::SectionSummary>, String> {
+    let db = state.db.lock().unwrap();
+    db.get_section_summaries(&document_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_topic_clusters(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::db::TopicCluster>, String> {
+    let db = state.db.lock().unwrap();
+    db.get_topic_clusters().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_library_overview(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::db::LibrarySummary>, String> {
+    let db = state.db.lock().unwrap();
+    db.get_library_summary().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn refresh_library_summary(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let cfg = state.config.lock().unwrap().load();
+
+    // Get all document summaries
+    let docs = {
+        let db = state.db.lock().unwrap();
+        db.list_document_ids_and_titles().map_err(|e| e.to_string())?
+    };
+
+    if docs.is_empty() {
+        return Err("No documents in library".to_string());
+    }
+
+    // Collect document descriptions — use cached summary if available, fall back to metadata
+    let mut doc_summaries = Vec::new();
+    {
+        let db = state.db.lock().unwrap();
+        for (id, title, author) in &docs {
+            if let Ok(Some(summary)) = db.get_summary(id, "short") {
+                doc_summaries.push(format!("\"{}\" by {}: {}", title, author, summary));
+            } else if let Ok(Some(doc)) = db.get_document(id) {
+                let desc = doc.description.unwrap_or_default();
+                let tags = if doc.tags.is_empty() { String::new() } else { format!(" [{}]", doc.tags.join(", ")) };
+                if !desc.is_empty() {
+                    doc_summaries.push(format!("\"{}\" by {}: {}{}", title, author, desc, tags));
+                } else {
+                    doc_summaries.push(format!("\"{}\" by {}{}", title, author, tags));
+                }
+            }
+        }
+    }
+
+    if doc_summaries.is_empty() {
+        return Err("No documents found.".to_string());
+    }
+
+    // Cap the combined summaries to ~20k chars to stay within token limits
+    let mut combined = String::new();
+    for s in &doc_summaries {
+        if combined.len() + s.len() > 20_000 {
+            combined.push_str(&format!("\n\n... and {} more documents", doc_summaries.len() - combined.matches("\n\n").count()));
+            break;
+        }
+        if !combined.is_empty() {
+            combined.push_str("\n\n");
+        }
+        combined.push_str(s);
+    }
+
+    let prompt = format!(
+        "You have a library of {} documents. Here are descriptions of each:\n\n{}\n\n\
+         Write a 3-5 sentence overview of this library's contents, themes, and scope.\n\
+         Also list 5-10 major themes as a JSON array.\n\n\
+         Respond with JSON: {{\"summary\": \"...\", \"themes\": [\"theme1\", \"theme2\", ...]}}\n\n\
+         Respond with ONLY the JSON.",
+        docs.len(),
+        combined
+    );
+
+    let result = if cfg.ai_provider == "ollama" {
+        let ollama = crate::ollama::OllamaClient::new();
+        ollama.generate_json(&cfg.ollama_base_url, &cfg.ollama_model, &prompt).await
+    } else {
+        let api_key = cfg.anthropic_api_key.as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "No API key configured".to_string())?;
+        let claude = crate::claude::ClaudeClient::new();
+        claude.generate_json(api_key, &cfg.model, &prompt).await
+    }?;
+
+    let summary = result["summary"].as_str().unwrap_or("").to_string();
+    let themes = result["themes"].as_array()
+        .map(|arr| serde_json::to_string(arr).unwrap_or_default());
+
+    {
+        let db = state.db.lock().unwrap();
+        db.upsert_library_summary(&summary, themes.as_deref(), docs.len() as i64)
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(summary)
 }

@@ -21,6 +21,8 @@ import {
   formatFileSize,
   getSystemHardware,
   getModelFits,
+  getLibraryOverview,
+  refreshLibrarySummary,
 } from "../lib/api";
 import type {
   Settings as SettingsType,
@@ -33,6 +35,7 @@ import type {
   RecommendedModel,
   HardwareInfo,
   ModelFitInfo,
+  LibrarySummary,
 } from "../lib/api";
 
 const MODELS = [
@@ -70,6 +73,8 @@ export function Settings() {
   const [hardwareInfo, setHardwareInfo] = useState<HardwareInfo | null>(null);
   const [modelFits, setModelFits] = useState<ModelFitInfo[]>([]);
   const [useCaseFilter, setUseCaseFilter] = useState<string | null>(null);
+  const [librarySummary, setLibrarySummary] = useState<LibrarySummary | null>(null);
+  const [libraryLoading, setLibraryLoading] = useState(false);
 
   const refreshOllama = useCallback(() => {
     checkOllamaStatus().then((s) => {
@@ -101,6 +106,7 @@ export function Settings() {
     refreshWhisperModels();
     refreshOllama();
     checkExternalTools().then(setExternalTools).catch(() => {});
+    getLibraryOverview().then(setLibrarySummary).catch(() => {});
     // Check if there's already a running batch-embed task
     getTasks(20).then((tasks) => {
       const running = tasks.find(
@@ -1232,6 +1238,90 @@ export function Settings() {
               Cloudflare credentials saved
             </motion.div>
           )}
+        </section>
+
+        {/* Library Overview */}
+        <section className={css({ marginBottom: "2xl" })}>
+          <h2
+            className={css({
+              fontSize: "md",
+              fontWeight: 600,
+              color: "text.primary",
+              marginBottom: "xs",
+            })}
+          >
+            Library Overview
+          </h2>
+          <p
+            className={css({
+              fontSize: "sm",
+              color: "text.muted",
+              marginBottom: "md",
+              lineHeight: 1.5,
+            })}
+          >
+            Generate an AI summary of your entire library. This helps the chat
+            agent understand the scope and themes of your collection.
+          </p>
+          {librarySummary && (
+            <div
+              className={css({
+                padding: "md",
+                bg: "bg.surface",
+                border: "1px solid",
+                borderColor: "border.base",
+                borderRadius: "md",
+                marginBottom: "md",
+              })}
+            >
+              <div className={css({ fontSize: "sm", color: "text.secondary", lineHeight: 1.6 })}>
+                {librarySummary.summary}
+              </div>
+              {librarySummary.themes && (
+                <div className={css({ fontSize: "xs", color: "text.muted", marginTop: "sm" })}>
+                  Themes: {(() => {
+                    try {
+                      return JSON.parse(librarySummary.themes).join(", ");
+                    } catch {
+                      return librarySummary.themes;
+                    }
+                  })()}
+                </div>
+              )}
+              <div className={css({ fontSize: "xs", color: "text.muted", marginTop: "xs" })}>
+                {librarySummary.document_count} documents · Updated {librarySummary.updated_at}
+              </div>
+            </div>
+          )}
+          <button
+            onClick={async () => {
+              setLibraryLoading(true);
+              try {
+                await refreshLibrarySummary();
+                const overview = await getLibraryOverview();
+                setLibrarySummary(overview);
+              } catch (e) {
+                console.error("Library summary failed:", e);
+              }
+              setLibraryLoading(false);
+            }}
+            disabled={libraryLoading}
+            className={css({
+              padding: "sm",
+              paddingLeft: "md",
+              paddingRight: "md",
+              bg: libraryLoading ? "bg.elevated" : "accent.base",
+              color: "white",
+              borderRadius: "md",
+              fontSize: "sm",
+              fontWeight: 500,
+              cursor: libraryLoading ? "default" : "pointer",
+              opacity: libraryLoading ? 0.6 : 1,
+              _hover: libraryLoading ? {} : { opacity: 0.9 },
+            } as any)}
+          >
+            {libraryLoading ? "Generating..." : librarySummary ? "Regenerate" : "Generate Library Overview"}
+          </button>
         </section>
 
         {/* Embedding Index */}
