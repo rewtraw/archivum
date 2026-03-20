@@ -75,6 +75,7 @@ export function Settings() {
   const [useCaseFilter, setUseCaseFilter] = useState<string | null>(null);
   const [librarySummary, setLibrarySummary] = useState<LibrarySummary | null>(null);
   const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
 
   const refreshOllama = useCallback(() => {
     checkOllamaStatus().then((s) => {
@@ -1296,12 +1297,14 @@ export function Settings() {
           <button
             onClick={async () => {
               setLibraryLoading(true);
+              setLibraryError(null);
               try {
                 await refreshLibrarySummary();
                 const overview = await getLibraryOverview();
                 setLibrarySummary(overview);
-              } catch (e) {
+              } catch (e: any) {
                 console.error("Library summary failed:", e);
+                setLibraryError(typeof e === "string" ? e : e?.message || "Failed to generate library overview");
               }
               setLibraryLoading(false);
             }}
@@ -1322,6 +1325,11 @@ export function Settings() {
           >
             {libraryLoading ? "Generating..." : librarySummary ? "Regenerate" : "Generate Library Overview"}
           </button>
+          {libraryError && (
+            <p className={css({ fontSize: "xs", color: "#f87171", marginTop: "sm" })}>
+              {libraryError}
+            </p>
+          )}
         </section>
 
         {/* Embedding Index */}
