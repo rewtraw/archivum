@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Archivum — Your Personal Library, Infinitely Organized</title>
+<meta name="description" content="A native macOS app for acquiring, archiving, and reading digital text content. AI-powered document management with local-first architecture.">
+<link rel="icon" type="image/png" href="archivum-logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=DM+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --wood-darkest: #1a0f06;
+  --wood-dark: #2a1a0c;
+  --wood-mid: #3a2210;
+  --wood-warm: #5a3a1a;
+  --wood-light: #8b5e2b;
+  --amber: #c49a3c;
+  --amber-light: #d4a843;
+  --bronze: #b8860b;
+  --bronze-light: #cd9b1d;
+  --copper: #d4956a;
+  --gold: #e8c46a;
+  --cream: #f5e6c8;
+  --cream-dim: #c9b896;
+  --text-primary: #f0e4d0;
+  --text-secondary: #b8a68e;
+  --text-muted: #8a7a66;
+  --shadow-deep: rgba(10, 5, 0, 0.6);
+  --glow-amber: rgba(196, 154, 60, 0.15);
+  --glow-bronze: rgba(184, 134, 11, 0.2);
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  background: var(--wood-darkest);
+  color: var(--text-primary);
+  overflow-x: hidden;
+  line-height: 1.6;
+}
+
+/* ── Noise texture overlay ── */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0.03;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 256px 256px;
+}
+
+/* ── Headings ── */
+h1, h2, h3, h4 {
+  font-family: 'Cormorant Garamond', serif;
+  font-weight: 600;
+  line-height: 1.15;
+}
+
+/* ── Scroll reveal ── */
+.reveal {
+  opacity: 0;
+  transform: translateY(32px);
+  transition: opacity 0.8s cubic-bezier(0.22, 1, 0.36, 1),
+              transform 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ── Nav ── */
+nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  padding: 1rem 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  backdrop-filter: blur(20px) saturate(1.4);
+  background: rgba(26, 15, 6, 0.7);
+  border-bottom: 1px solid rgba(196, 154, 60, 0.08);
+  transition: background 0.3s;
+}
+nav .logo {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  text-decoration: none;
+  color: var(--text-primary);
+}
+nav .logo img {
+  width: 32px;
+  height: 32px;
+  border-radius: 7px;
+}
+nav .logo span {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.3rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+nav .nav-links {
+  display: flex;
+  gap: 2rem;
+  align-items: center;
+}
+nav .nav-links a {
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.85rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  transition: color 0.2s;
+}
+nav .nav-links a:hover { color: var(--amber); }
+nav .nav-links .gh-link {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+nav .nav-links .gh-link svg { width: 18px; height: 18px; fill: currentColor; }
+
+/* ── Hero ── */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 8rem 2rem 4rem;
+  position: relative;
+}
+
+/* Radial glow behind hero */
+.hero::before {
+  content: '';
+  position: absolute;
+  top: 10%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 800px;
+  height: 800px;
+  background: radial-gradient(ellipse, rgba(196, 154, 60, 0.06) 0%, rgba(184, 134, 11, 0.03) 40%, transparent 70%);
+  pointer-events: none;
+}
+
+/* Wood grain lines */
+.hero::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.015;
+  background: repeating-linear-gradient(
+    92deg,
+    transparent 0px,
+    transparent 40px,
+    rgba(196, 154, 60, 0.5) 40px,
+    rgba(196, 154, 60, 0.5) 41px,
+    transparent 41px,
+    transparent 80px
+  );
+}
+
+.hero-icon {
+  width: 220px;
+  height: 220px;
+  border-radius: 44px;
+  margin-bottom: 2.5rem;
+  position: relative;
+  z-index: 1;
+  box-shadow:
+    0 0 0 1px rgba(196, 154, 60, 0.15),
+    0 20px 60px -10px rgba(0, 0, 0, 0.5),
+    0 0 120px rgba(196, 154, 60, 0.08);
+  animation: iconFloat 6s ease-in-out infinite;
+}
+@keyframes iconFloat {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-8px); }
+}
+
+.hero h1 {
+  font-size: clamp(3.5rem, 8vw, 6.5rem);
+  letter-spacing: -0.01em;
+  position: relative;
+  z-index: 1;
+  background: linear-gradient(170deg, var(--cream) 20%, var(--amber) 50%, var(--bronze-light) 80%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.hero .tagline {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: clamp(1.2rem, 2.5vw, 1.6rem);
+  font-weight: 400;
+  font-style: italic;
+  color: var(--text-secondary);
+  margin-top: 1rem;
+  position: relative;
+  z-index: 1;
+}
+
+.hero .subtitle {
+  font-size: 0.95rem;
+  color: var(--text-muted);
+  max-width: 520px;
+  margin-top: 1.5rem;
+  line-height: 1.7;
+  position: relative;
+  z-index: 1;
+}
+
+.hero-cta {
+  display: flex;
+  gap: 1rem;
+  margin-top: 2.5rem;
+  position: relative;
+  z-index: 1;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.85rem 2rem;
+  background: linear-gradient(135deg, var(--bronze) 0%, var(--amber) 100%);
+  color: var(--wood-darkest);
+  font-weight: 600;
+  font-size: 0.9rem;
+  letter-spacing: 0.02em;
+  border-radius: 10px;
+  text-decoration: none;
+  border: none;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+  box-shadow: 0 4px 20px rgba(184, 134, 11, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+.btn-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 30px rgba(184, 134, 11, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+.btn-primary svg { width: 18px; height: 18px; }
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.85rem 2rem;
+  background: transparent;
+  color: var(--text-secondary);
+  font-weight: 500;
+  font-size: 0.9rem;
+  letter-spacing: 0.02em;
+  border-radius: 10px;
+  text-decoration: none;
+  border: 1px solid rgba(196, 154, 60, 0.2);
+  cursor: pointer;
+  transition: all 0.3s;
+}
+.btn-secondary:hover {
+  border-color: rgba(196, 154, 60, 0.4);
+  color: var(--amber);
+  background: rgba(196, 154, 60, 0.05);
+}
+.btn-secondary svg { width: 18px; height: 18px; fill: currentColor; }
+
+/* ── Divider ── */
+.section-divider {
+  width: 60px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--amber), transparent);
+  margin: 0 auto;
+  opacity: 0.4;
+}
+
+/* ── Features ── */
+.features {
+  padding: 6rem 2rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+.features .section-label {
+  text-align: center;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--amber);
+  margin-bottom: 1rem;
+}
+.features h2 {
+  text-align: center;
+  font-size: clamp(2rem, 4vw, 3rem);
+  color: var(--text-primary);
+  margin-bottom: 1rem;
+}
+.features .section-desc {
+  text-align: center;
+  color: var(--text-muted);
+  max-width: 500px;
+  margin: 0 auto 4rem;
+  font-size: 0.95rem;
+}
+
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1.5rem;
+}
+
+.feature-card {
+  padding: 2rem;
+  border-radius: 16px;
+  background: linear-gradient(145deg, rgba(58, 34, 16, 0.4) 0%, rgba(42, 26, 12, 0.6) 100%);
+  border: 1px solid rgba(196, 154, 60, 0.06);
+  transition: all 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+  position: relative;
+  overflow: hidden;
+}
+.feature-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(196, 154, 60, 0.15), transparent);
+  opacity: 0;
+  transition: opacity 0.4s;
+}
+.feature-card:hover {
+  border-color: rgba(196, 154, 60, 0.12);
+  transform: translateY(-4px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+}
+.feature-card:hover::before { opacity: 1; }
+
+.feature-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 1.25rem;
+  background: linear-gradient(135deg, rgba(184, 134, 11, 0.12), rgba(196, 154, 60, 0.06));
+  border: 1px solid rgba(196, 154, 60, 0.1);
+  color: var(--amber);
+}
+.feature-icon svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+
+.feature-card h3 {
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-bottom: 0.6rem;
+  color: var(--cream);
+}
+.feature-card p {
+  font-size: 0.88rem;
+  color: var(--text-muted);
+  line-height: 1.65;
+}
+
+/* ── How It Works ── */
+.how-it-works {
+  padding: 6rem 2rem;
+  max-width: 1000px;
+  margin: 0 auto;
+}
+.how-it-works .section-label {
+  text-align: center;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--amber);
+  margin-bottom: 1rem;
+}
+.how-it-works h2 {
+  text-align: center;
+  font-size: clamp(2rem, 4vw, 3rem);
+  margin-bottom: 4rem;
+}
+
+.steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2rem;
+  position: relative;
+}
+/* Connecting line */
+.steps::before {
+  content: '';
+  position: absolute;
+  top: 40px;
+  left: 15%;
+  right: 15%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, var(--wood-warm) 20%, var(--amber) 50%, var(--wood-warm) 80%, transparent 100%);
+  opacity: 0.3;
+}
+
+.step {
+  text-align: center;
+  position: relative;
+}
+.step-number {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 1.5rem;
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.8rem;
+  font-weight: 700;
+  color: var(--amber);
+  background: radial-gradient(circle, rgba(184, 134, 11, 0.08) 0%, rgba(42, 26, 12, 0.8) 70%);
+  border: 1px solid rgba(196, 154, 60, 0.15);
+  position: relative;
+  z-index: 1;
+}
+.step h3 {
+  font-size: 1.3rem;
+  margin-bottom: 0.5rem;
+  color: var(--cream);
+}
+.step p {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  line-height: 1.6;
+  max-width: 260px;
+  margin: 0 auto;
+}
+
+/* ── Tech Stack ── */
+.tech-stack {
+  padding: 4rem 2rem 6rem;
+  text-align: center;
+}
+.tech-stack .section-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 2rem;
+}
+.tech-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.75rem;
+}
+.tech-badge {
+  padding: 0.5rem 1.2rem;
+  border-radius: 100px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+  background: rgba(58, 34, 16, 0.5);
+  border: 1px solid rgba(196, 154, 60, 0.08);
+  transition: all 0.3s;
+}
+.tech-badge:hover {
+  border-color: rgba(196, 154, 60, 0.2);
+  color: var(--amber-light);
+  background: rgba(58, 34, 16, 0.8);
+}
+
+/* ── Footer ── */
+footer {
+  padding: 3rem 2rem;
+  text-align: center;
+  border-top: 1px solid rgba(196, 154, 60, 0.06);
+}
+footer .footer-inner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2rem;
+  flex-wrap: wrap;
+}
+footer a {
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.8rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  transition: color 0.2s;
+}
+footer a:hover { color: var(--amber); }
+footer a svg { width: 16px; height: 16px; fill: currentColor; }
+footer .separator {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--wood-warm);
+}
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  nav .nav-links { gap: 1rem; }
+  nav .nav-links a.hide-mobile { display: none; }
+  .hero-icon { width: 120px; height: 120px; border-radius: 24px; }
+  .features-grid { grid-template-columns: 1fr; }
+  .steps {
+    grid-template-columns: 1fr;
+    gap: 3rem;
+  }
+  .steps::before { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+  <a href="#" class="logo">
+    <img src="archivum-logo.png" alt="Archivum">
+    <span>Archivum</span>
+  </a>
+  <div class="nav-links">
+    <a href="#features" class="hide-mobile">Features</a>
+    <a href="#how-it-works" class="hide-mobile">How It Works</a>
+    <a href="https://github.com/rewtraw/archivum" target="_blank" class="gh-link">
+      <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <img src="archivum-logo.png" alt="Archivum" class="hero-icon reveal">
+  <h1 class="reveal" style="transition-delay: 0.1s">Archivum</h1>
+  <p class="tagline reveal" style="transition-delay: 0.2s">Your personal library, infinitely organized</p>
+  <p class="subtitle reveal" style="transition-delay: 0.3s">
+    A native macOS app that acquires, archives, and enriches your digital text collection with AI-powered understanding.
+  </p>
+  <div class="hero-cta reveal" style="transition-delay: 0.4s">
+    <a href="https://github.com/rewtraw/archivum/releases" class="btn-primary">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Download for macOS
+    </a>
+    <a href="https://github.com/rewtraw/archivum" target="_blank" class="btn-secondary">
+      <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      View Source
+    </a>
+  </div>
+</section>
+
+<div class="section-divider"></div>
+
+<!-- Features -->
+<section class="features" id="features">
+  <p class="section-label reveal">Capabilities</p>
+  <h2 class="reveal" style="transition-delay: 0.1s">Everything your library needs</h2>
+  <p class="section-desc reveal" style="transition-delay: 0.15s">
+    From import to research, every step is enriched by AI and built to run locally.
+  </p>
+  <div class="features-grid">
+    <div class="feature-card reveal" style="transition-delay: 0.1s">
+      <div class="feature-icon">
+        <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      </div>
+      <h3>AI-Powered Import</h3>
+      <p>Drop any document and Claude or Ollama extracts metadata, structure, and full text automatically. Titles, authors, tags, and descriptions appear like magic.</p>
+    </div>
+    <div class="feature-card reveal" style="transition-delay: 0.15s">
+      <div class="feature-icon">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/><path d="M11 8v6"/><path d="M8 11h6"/></svg>
+      </div>
+      <h3>Agentic RAG Chat</h3>
+      <p>A multi-step research assistant that searches, reads summaries, refines queries, and synthesizes answers across your entire library with citations.</p>
+    </div>
+    <div class="feature-card reveal" style="transition-delay: 0.2s">
+      <div class="feature-icon">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+      </div>
+      <h3>Smart Search</h3>
+      <p>Full-text keyword search and semantic vector search work together. Find passages by meaning, not just exact words, across every document you own.</p>
+    </div>
+    <div class="feature-card reveal" style="transition-delay: 0.25s">
+      <div class="feature-icon">
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+      </div>
+      <h3>Hierarchical Summaries</h3>
+      <p>Section-level, document-level, and library-wide AI summaries give you a bird's-eye view. The agent uses these as a navigation map before diving into details.</p>
+    </div>
+    <div class="feature-card reveal" style="transition-delay: 0.3s">
+      <div class="feature-icon">
+        <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+      </div>
+      <h3>Local-First</h3>
+      <p>SQLite database, local embeddings, and optional local LLMs via Ollama. Your documents never leave your Mac unless you want them to.</p>
+    </div>
+    <div class="feature-card reveal" style="transition-delay: 0.35s">
+      <div class="feature-icon">
+        <svg viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+      </div>
+      <h3>Every Format</h3>
+      <p>PDF, EPUB, MOBI, DjVu, HTML, Markdown, plain text, comic archives, and audio/video with Whisper transcription. If it has words, Archivum reads it.</p>
+    </div>
+  </div>
+</section>
+
+<div class="section-divider"></div>
+
+<!-- How It Works -->
+<section class="how-it-works" id="how-it-works">
+  <p class="section-label reveal">Workflow</p>
+  <h2 class="reveal" style="transition-delay: 0.1s">Three steps to a living library</h2>
+  <div class="steps">
+    <div class="step reveal" style="transition-delay: 0.15s">
+      <div class="step-number">I</div>
+      <h3>Import</h3>
+      <p>Drop files or paste URLs. Archivum deduplicates, stores originals by content hash, and extracts text locally.</p>
+    </div>
+    <div class="step reveal" style="transition-delay: 0.25s">
+      <div class="step-number">II</div>
+      <h3>Enrich</h3>
+      <p>AI extracts metadata, generates summaries, creates embeddings, and builds a searchable index of every passage.</p>
+    </div>
+    <div class="step reveal" style="transition-delay: 0.35s">
+      <div class="step-number">III</div>
+      <h3>Research</h3>
+      <p>Ask questions. The agentic assistant searches, cross-references, and synthesizes answers from across your collection.</p>
+    </div>
+  </div>
+</section>
+
+<div class="section-divider"></div>
+
+<!-- Tech Stack -->
+<section class="tech-stack reveal">
+  <p class="section-label">Built With</p>
+  <div class="tech-badges">
+    <span class="tech-badge">Tauri v2</span>
+    <span class="tech-badge">Rust</span>
+    <span class="tech-badge">React</span>
+    <span class="tech-badge">SQLite</span>
+    <span class="tech-badge">Claude API</span>
+    <span class="tech-badge">Ollama</span>
+    <span class="tech-badge">fastembed</span>
+    <span class="tech-badge">Whisper</span>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer>
+  <div class="footer-inner">
+    <a href="https://github.com/rewtraw/archivum" target="_blank">
+      <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      Source on GitHub
+    </a>
+    <span class="separator"></span>
+    <a href="#">Built with Rust + Tauri</a>
+    <span class="separator"></span>
+    <a href="#">Apache 2.0 License</a>
+  </div>
+</footer>
+
+<script>
+// Scroll reveal
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.classList.add('visible');
+    }
+  });
+}, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+
+document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+</script>
+
+</body>
+</html>
