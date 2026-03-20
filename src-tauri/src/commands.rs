@@ -1901,3 +1901,273 @@ pub async fn refresh_library_summary(
 
     Ok(summary)
 }
+
+// --- Chat Auto-Titling ---
+
+#[tauri::command]
+pub async fn auto_title_session(
+    session_id: String,
+    question: String,
+    answer: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let cfg = state.config.lock().unwrap().load();
+
+    let q_trunc = &question[..floor_char_boundary(&question, 200)];
+    let a_trunc = &answer[..floor_char_boundary(&answer, 300)];
+
+    let prompt = format!(
+        "Generate a short title (3-7 words) for this conversation. Return ONLY the title text, nothing else.\n\n\
+         User: {}\nAssistant: {}",
+        q_trunc, a_trunc
+    );
+
+    let title = if cfg.ai_provider == "ollama" {
+        let ollama = crate::ollama::OllamaClient::new();
+        match ollama.generate_json(&cfg.ollama_base_url, &cfg.ollama_model, &format!(
+            "{}\n\nRespond with JSON: {{\"title\": \"...\"}}", prompt
+        )).await {
+            Ok(json) => json["title"].as_str().unwrap_or("New chat").to_string(),
+            Err(_) => q_trunc.to_string(),
+        }
+    } else {
+        let api_key = cfg.anthropic_api_key.as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "No API key".to_string())?;
+        let claude = crate::claude::ClaudeClient::new();
+        match claude.generate_json(api_key, &cfg.model, &format!(
+            "{}\n\nRespond with JSON: {{\"title\": \"...\"}}", prompt
+        )).await {
+            Ok(json) => json["title"].as_str().unwrap_or("New chat").to_string(),
+            Err(_) => q_trunc.to_string(),
+        }
+    };
+
+    let clean = title.trim().trim_matches('"').trim_matches('*').to_string();
+    let final_title = if clean.is_empty() || clean.len() > 80 {
+        q_trunc.to_string()
+    } else {
+        clean
+    };
+
+    let db = state.db.lock().unwrap();
+    db.update_chat_session_title(&session_id, &final_title)
+        .map_err(|e| e.to_string())?;
+
+    Ok(final_title)
+}
+
+// --- Collections ---
+
+#[tauri::command]
+pub async fn fetch_collection(
+    url: String,
+) -> Result<crate::collections::CollectionManifest, String> {
+    crate::collections::fetch_manifest(&url).await
+}
+
+#[tauri::command]
+pub async fn import_collection(
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ImportResult>, String> {
+    let manifest = crate::collections::fetch_manifest(&url).await?;
+    let mut results = Vec::new();
+
+    let temp_dir = std::env::temp_dir().join("archivum_collections");
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+
+    for doc in &manifest.documents {
+        let ext = doc.format.as_str();
+        let filename = format!("{}.{}", doc.title.replace('/', "-"), ext);
+        let temp_path = temp_dir.join(&filename);
+
+        if let Err(e) = crate::collections::download_document(&doc.url, &temp_path).await {
+            eprintln!("[collections] Failed to download {}: {}", doc.title, e);
+            continue;
+        }
+
+        let doc_id = uuid::Uuid::new_v4().to_string();
+        let task_id = uuid::Uuid::new_v4().to_string();
+
+        {
+            let db = state.db.lock().unwrap();
+            db.create_task(&task_id, &doc_id, "import")
+                .map_err(|e| e.to_string())?;
+        }
+
+        let db = state.db.clone();
+        let storage = crate::storage::StorageLayout::new(
+            state.storage.originals_dir().parent().unwrap().to_path_buf(),
+        );
+        let claude = crate::claude::ClaudeClient::new();
+        let config = state.config.clone();
+        let embeddings = state.embeddings.clone();
+        let tid = task_id.clone();
+        let did = doc_id.clone();
+
+        std::thread::spawn({
+            let config2 = config.clone();
+            let db2 = db.clone();
+            move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(crate::pipeline::import_file(
+                    &db, &storage, &claude, &config, &temp_path, &tid, &did, &embeddings,
+                ));
+                if let Err(e) = &result {
+                    eprintln!("[collections] import error: {}", e);
+                }
+                if result.is_ok() {
+                    if let Err(e) = rt.block_on(crate::pipeline::generate_section_summaries_local(&db2, &config2, &did)) {
+                        eprintln!("[collections] section summary failed: {}", e);
+                    }
+                }
+                let _ = std::fs::remove_file(&temp_path);
+            }
+        });
+
+        results.push(ImportResult {
+            document_id: doc_id,
+            task_id,
+            filename,
+        });
+    }
+
+    Ok(results)
+}
+
+// --- ZIM Import ---
+
+#[tauri::command]
+pub async fn import_zim_articles(
+    zim_path: String,
+    max_articles: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ImportResult>, String> {
+    let path = std::path::Path::new(&zim_path);
+    if !path.exists() {
+        return Err("ZIM file not found".to_string());
+    }
+
+    let zim = zim::Zim::new(&zim_path)
+        .map_err(|e| format!("Failed to open ZIM file: {}", e))?;
+
+    let mut results = Vec::new();
+    let limit = max_articles.unwrap_or(50);
+
+    // Iterate articles by URL index
+    let article_count = zim.article_count();
+    let mut imported = 0;
+
+    for idx in 0..article_count as u32 {
+        if imported >= limit {
+            break;
+        }
+
+        let entry = match zim.get_by_url_index(idx) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Only content articles (namespace A or C), skip redirects
+        let is_content = matches!(entry.namespace, zim::Namespace::Articles | zim::Namespace::UserContent);
+        let target = match &entry.target {
+            Some(zim::Target::Cluster(cluster_idx, blob_idx)) => Some((*cluster_idx, *blob_idx)),
+            _ => None,
+        };
+
+        if !is_content || target.is_none() {
+            continue;
+        }
+
+        // Only process HTML content
+        let is_html = matches!(&entry.mime_type, zim::MimeType::Type(s) if s.contains("html"));
+        if !is_html {
+            continue;
+        }
+
+        let title = if entry.title.is_empty() { entry.url.clone() } else { entry.title.clone() };
+
+        // Read the blob data
+        let (cluster_idx, blob_idx) = target.unwrap();
+        let cluster = match zim.get_cluster(cluster_idx) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let blob = match cluster.get_blob(blob_idx) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        let html = String::from_utf8_lossy(&blob).to_string();
+        let text = html2text::from_read(html.as_bytes(), 80)
+            .unwrap_or_else(|_| html.clone());
+
+        if text.trim().len() < 100 {
+            continue;
+        }
+
+        imported += 1;
+
+        let doc_id = uuid::Uuid::new_v4().to_string();
+        let task_id = uuid::Uuid::new_v4().to_string();
+
+        {
+            let db = state.db.lock().unwrap();
+            db.create_task(&task_id, &doc_id, "import")
+                .map_err(|e| e.to_string())?;
+        }
+
+        let db = state.db.clone();
+        let storage = crate::storage::StorageLayout::new(
+            state.storage.originals_dir().parent().unwrap().to_path_buf(),
+        );
+        let config = state.config.clone();
+        let embeddings_arc = state.embeddings.clone();
+        let doc_id_c = doc_id.clone();
+        let task_id_c = task_id.clone();
+        let title_c = title.clone();
+        let text_c = text.clone();
+
+        std::thread::spawn({
+            let config2 = config.clone();
+            let db2 = db.clone();
+            move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let data_dir = storage.originals_dir().parent().unwrap().to_path_buf();
+                let embed_engine = rt.block_on(async {
+                    embeddings_arc
+                        .get_or_try_init(|| async {
+                            crate::embeddings::EmbeddingEngine::new(&data_dir.join("models"))
+                        })
+                        .await
+                        .ok()
+                });
+
+                let result = crate::pipeline::import_text_content(
+                    &db, &storage, &task_id_c, &doc_id_c,
+                    &title_c, "Wikipedia", &text_c,
+                    &["reference", "wikipedia"],
+                    embed_engine,
+                );
+                if let Err(e) = &result {
+                    eprintln!("[zim] import error for {}: {}", title_c, e);
+                }
+                if result.is_ok() {
+                    if let Err(e) = rt.block_on(crate::pipeline::generate_section_summaries_local(&db2, &config2, &doc_id_c)) {
+                        eprintln!("[zim] section summary failed: {}", e);
+                    }
+                }
+            }
+        });
+
+        results.push(ImportResult {
+            document_id: doc_id,
+            task_id,
+            filename: format!("{}.zim", title),
+        });
+    }
+
+    Ok(results)
+}

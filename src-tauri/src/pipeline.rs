@@ -1296,16 +1296,78 @@ pub async fn import_from_url(
     )
 }
 
+/// Import raw text content as a document (used by ZIM import and other text sources).
+pub fn import_text_content(
+    db: &Arc<Mutex<Database>>,
+    storage: &StorageLayout,
+    task_id: &str,
+    doc_id: &str,
+    title: &str,
+    author: &str,
+    markdown_content: &str,
+    tags: &[&str],
+    embeddings: Option<&EmbeddingEngine>,
+) -> Result<String, String> {
+    // Create a dummy hash from the content
+    use sha2::{Sha256, Digest};
+    let hash = format!("{:x}", Sha256::digest(markdown_content.as_bytes()));
+
+    // Check for duplicates
+    {
+        let db_lock = db.lock().unwrap();
+        if db_lock.has_hash(&hash).map_err(|e| e.to_string())? {
+            return Err("Content already exists in library".to_string());
+        }
+    }
+
+    // Insert document record
+    {
+        let db_lock = db.lock().unwrap();
+        db_lock.insert_document(doc_id, "text", &hash, markdown_content.len() as i64, "zim-import")
+            .map_err(|e| e.to_string())?;
+    }
+
+    let tag_strings: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
+
+    finish_import(
+        db, storage, task_id, doc_id,
+        title, author,
+        None, None, None, None, None, None,
+        markdown_content, &tag_strings, None,
+        Some("Reference imported"),
+        embeddings, None,
+    )
+}
+
 /// Generate section summaries for a document after import.
 /// Groups chunks into sections of 4 and summarizes each with AI.
+/// When `local_only` is true, only uses Ollama (skips if not configured).
 pub async fn generate_section_summaries_async(
     db: &Arc<Mutex<Database>>,
     config: &Arc<Mutex<ConfigManager>>,
     doc_id: &str,
 ) -> Result<(), String> {
+    generate_section_summaries_inner(db, config, doc_id, false).await
+}
+
+/// Like `generate_section_summaries_async` but only uses Ollama — no API costs.
+/// Silently skips if Ollama is not configured.
+pub async fn generate_section_summaries_local(
+    db: &Arc<Mutex<Database>>,
+    config: &Arc<Mutex<ConfigManager>>,
+    doc_id: &str,
+) -> Result<(), String> {
+    generate_section_summaries_inner(db, config, doc_id, true).await
+}
+
+async fn generate_section_summaries_inner(
+    db: &Arc<Mutex<Database>>,
+    config: &Arc<Mutex<ConfigManager>>,
+    doc_id: &str,
+    local_only: bool,
+) -> Result<(), String> {
     let chunks = {
         let db_lock = db.lock().unwrap();
-        // Skip if already has section summaries
         if db_lock.has_section_summaries(doc_id).unwrap_or(false) {
             return Ok(());
         }
@@ -1313,10 +1375,16 @@ pub async fn generate_section_summaries_async(
     };
 
     if chunks.len() < 2 {
-        return Ok(()); // Too few chunks to bother
+        return Ok(());
     }
 
     let cfg = config.lock().unwrap().load();
+
+    // In local_only mode, require Ollama
+    if local_only && (cfg.ollama_model.is_empty()) {
+        return Ok(()); // No local model configured, skip silently
+    }
+
     let section_size = 4;
     let mut sections = Vec::new();
 
@@ -1336,13 +1404,13 @@ pub async fn generate_section_summaries_async(
             &combined_text[..floor_char_boundary(&combined_text, 6000)]
         );
 
-        let result = if cfg.ai_provider == "ollama" {
+        let result = if local_only || cfg.ai_provider == "ollama" {
             let ollama = crate::ollama::OllamaClient::new();
             ollama.generate_json(&cfg.ollama_base_url, &cfg.ollama_model, &prompt).await
         } else {
             let api_key = cfg.anthropic_api_key.as_deref().unwrap_or("");
             if api_key.is_empty() {
-                return Ok(()); // No API key, skip silently
+                return Ok(());
             }
             let claude = ClaudeClient::new();
             claude.generate_json(api_key, &cfg.model, &prompt).await

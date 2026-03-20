@@ -201,26 +201,27 @@ fn execute_tool(
 
             match scope {
                 AgentScope::Document { document_id, .. } => {
-                    let chunks = db.search_chunks(&query_embedding, document_id, limit)
+                    let chunks = db.search_chunks(&query_embedding, document_id, limit * 2)
                         .map_err(|e| e.to_string())?;
-                    if chunks.is_empty() {
+                    let reranked = crate::rerank::rerank_document_results(chunks, query);
+                    let top: Vec<_> = reranked.into_iter().take(limit).collect();
+                    if top.is_empty() {
                         "No matching passages found.".to_string()
                     } else {
-                        chunks.iter().enumerate()
+                        top.iter().enumerate()
                             .map(|(i, c)| format!("[{}] (chunk {}) {}", i + 1, c.chunk_index, c.content))
                             .collect::<Vec<_>>()
                             .join("\n\n")
                     }
                 }
                 AgentScope::Library => {
-                    let chunks = db.search_all_chunks(&query_embedding, limit * 3)
+                    let chunks = db.search_all_chunks(&query_embedding, limit * 5)
                         .map_err(|e| e.to_string())?;
-                    // Diversify across documents
-                    let diversified = crate::commands::diversify_chunks(chunks, limit);
-                    if diversified.is_empty() {
+                    let reranked = crate::rerank::rerank_results(chunks, query, limit);
+                    if reranked.is_empty() {
                         "No matching passages found.".to_string()
                     } else {
-                        diversified.iter().enumerate()
+                        reranked.iter().enumerate()
                             .map(|(i, c)| format!("[{} — \"{}\"] {}", i + 1, c.document_title, c.content))
                             .collect::<Vec<_>>()
                             .join("\n\n")

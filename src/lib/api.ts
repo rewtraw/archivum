@@ -595,6 +595,61 @@ export async function refreshLibrarySummary(): Promise<string> {
   return invoke("refresh_library_summary");
 }
 
+// --- Auto-Titling ---
+
+export async function autoTitleSession(
+  sessionId: string,
+  question: string,
+  answer: string
+): Promise<string> {
+  return invoke("auto_title_session", { sessionId, question, answer });
+}
+
+// --- Collections ---
+
+export interface CollectionManifest {
+  id: string;
+  name: string;
+  description: string;
+  author: string;
+  version: string;
+  tags: string[];
+  documents: CollectionDocument[];
+}
+
+export interface CollectionDocument {
+  title: string;
+  author: string;
+  url: string;
+  format: string;
+  description?: string;
+  tags: string[];
+}
+
+export async function fetchCollection(
+  url: string
+): Promise<CollectionManifest> {
+  return invoke("fetch_collection", { url });
+}
+
+export async function importCollection(
+  url: string
+): Promise<ImportResult[]> {
+  return invoke("import_collection", { url });
+}
+
+// --- ZIM Import ---
+
+export async function importZimArticles(
+  zimPath: string,
+  maxArticles?: number
+): Promise<ImportResult[]> {
+  return invoke("import_zim_articles", {
+    zimPath,
+    maxArticles: maxArticles ?? null,
+  });
+}
+
 export function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);

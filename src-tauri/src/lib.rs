@@ -1,11 +1,13 @@
 mod agent;
 mod claude;
+mod collections;
 mod commands;
 mod config;
 mod db;
 mod embeddings;
 pub mod ollama;
 mod pipeline;
+mod rerank;
 mod storage;
 pub mod whisper;
 
@@ -122,6 +124,10 @@ pub fn run() {
             commands::get_topic_clusters,
             commands::get_library_overview,
             commands::refresh_library_summary,
+            commands::auto_title_session,
+            commands::fetch_collection,
+            commands::import_collection,
+            commands::import_zim_articles,
             commands::pull_ollama_model,
             commands::delete_ollama_model,
         ])

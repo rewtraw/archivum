@@ -13,6 +13,7 @@ import {
   deleteChatSession,
   saveChatMessage,
   updateSessionTitle,
+  autoTitleSession,
 } from "../lib/api";
 import type { ChatEvent, SourceChunk, ChatSession } from "../lib/api";
 
@@ -268,6 +269,14 @@ export function ChatPanel({
             event.data.full_text || "",
             collectedSources ? JSON.stringify(collectedSources) : undefined
           ).catch(() => {});
+          // Auto-title on first exchange
+          if (messages.length <= 1) {
+            autoTitleSession(sessionId!, q, event.data.full_text || "")
+              .then((newTitle) => {
+                refreshSessions();
+              })
+              .catch(() => {});
+          }
           setIsStreaming(false);
           break;
         case "toolCall":

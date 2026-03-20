@@ -23,6 +23,9 @@ import {
   getModelFits,
   getLibraryOverview,
   refreshLibrarySummary,
+  fetchCollection,
+  importCollection,
+  importZimArticles,
 } from "../lib/api";
 import type {
   Settings as SettingsType,
@@ -36,6 +39,7 @@ import type {
   HardwareInfo,
   ModelFitInfo,
   LibrarySummary,
+  CollectionManifest,
 } from "../lib/api";
 
 const MODELS = [
@@ -76,6 +80,15 @@ export function Settings() {
   const [librarySummary, setLibrarySummary] = useState<LibrarySummary | null>(null);
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [collectionUrl, setCollectionUrl] = useState("");
+  const [collectionPreview, setCollectionPreview] = useState<CollectionManifest | null>(null);
+  const [collectionLoading, setCollectionLoading] = useState(false);
+  const [collectionError, setCollectionError] = useState<string | null>(null);
+  const [collectionImporting, setCollectionImporting] = useState(false);
+  const [zimPath, setZimPath] = useState("");
+  const [zimLoading, setZimLoading] = useState(false);
+  const [zimError, setZimError] = useState<string | null>(null);
+  const [zimCount, setZimCount] = useState("50");
 
   const refreshOllama = useCallback(() => {
     checkOllamaStatus().then((s) => {
@@ -1329,6 +1342,170 @@ export function Settings() {
             <p className={css({ fontSize: "xs", color: "#f87171", marginTop: "sm" })}>
               {libraryError}
             </p>
+          )}
+        </section>
+
+        {/* Collection Import */}
+        <section className={css({ marginBottom: "2xl" })}>
+          <h2 className={css({ fontSize: "md", fontWeight: 600, color: "text.primary", marginBottom: "xs" })}>
+            Import Collection
+          </h2>
+          <p className={css({ fontSize: "sm", color: "text.muted", marginBottom: "md", lineHeight: 1.5 })}>
+            Import a curated set of documents from a collection manifest URL (JSON).
+          </p>
+          <div className={css({ display: "flex", gap: "sm", alignItems: "center", marginBottom: "md" })}>
+            <input
+              type="text"
+              value={collectionUrl}
+              onChange={(e) => setCollectionUrl(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && collectionUrl.trim()) {
+                  setCollectionLoading(true);
+                  setCollectionError(null);
+                  fetchCollection(collectionUrl.trim())
+                    .then(setCollectionPreview)
+                    .catch((e) => setCollectionError(String(e)))
+                    .finally(() => setCollectionLoading(false));
+                }
+              }}
+              placeholder="https://example.com/collection.json"
+              className={css({
+                flex: 1, padding: "sm", paddingLeft: "md",
+                bg: "bg.surface", border: "1px solid", borderColor: "border.base",
+                borderRadius: "md", color: "text.primary", fontSize: "sm",
+                outline: "none", _focus: { borderColor: "accent.base" },
+              } as any)}
+            />
+            <button
+              onClick={() => {
+                if (!collectionUrl.trim()) return;
+                setCollectionLoading(true);
+                setCollectionError(null);
+                fetchCollection(collectionUrl.trim())
+                  .then(setCollectionPreview)
+                  .catch((e) => setCollectionError(String(e)))
+                  .finally(() => setCollectionLoading(false));
+              }}
+              disabled={collectionLoading || !collectionUrl.trim()}
+              className={css({
+                padding: "sm", paddingLeft: "md", paddingRight: "md",
+                bg: "accent.base", color: "white", borderRadius: "md",
+                fontSize: "sm", fontWeight: 500, cursor: "pointer",
+                opacity: collectionLoading || !collectionUrl.trim() ? 0.5 : 1,
+                _hover: { opacity: 0.9 },
+              } as any)}
+            >
+              {collectionLoading ? "Loading..." : "Preview"}
+            </button>
+          </div>
+          {collectionError && (
+            <p className={css({ fontSize: "xs", color: "#f87171", marginBottom: "sm" })}>{collectionError}</p>
+          )}
+          {collectionPreview && (
+            <div className={css({ padding: "md", bg: "bg.surface", border: "1px solid", borderColor: "border.base", borderRadius: "md", marginBottom: "md" })}>
+              <div className={css({ fontSize: "sm", fontWeight: 600, color: "text.primary" })}>{collectionPreview.name}</div>
+              <div className={css({ fontSize: "xs", color: "text.muted", marginTop: "2px" })}>
+                by {collectionPreview.author} · {collectionPreview.documents.length} documents · v{collectionPreview.version}
+              </div>
+              <div className={css({ fontSize: "sm", color: "text.secondary", marginTop: "sm", lineHeight: 1.5 })}>{collectionPreview.description}</div>
+              <div className={css({ marginTop: "sm", display: "flex", flexDirection: "column", gap: "xs", maxHeight: "200px", overflow: "auto" })}>
+                {collectionPreview.documents.map((d, i) => (
+                  <div key={i} className={css({ fontSize: "xs", color: "text.muted" })}>
+                    {d.title} by {d.author} ({d.format})
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={async () => {
+                  setCollectionImporting(true);
+                  setCollectionError(null);
+                  try {
+                    await importCollection(collectionUrl.trim());
+                    setCollectionPreview(null);
+                    setCollectionUrl("");
+                  } catch (e) {
+                    setCollectionError(String(e));
+                  }
+                  setCollectionImporting(false);
+                }}
+                disabled={collectionImporting}
+                className={css({
+                  marginTop: "md", padding: "sm", paddingLeft: "md", paddingRight: "md",
+                  bg: "accent.base", color: "white", borderRadius: "md",
+                  fontSize: "sm", fontWeight: 500, cursor: collectionImporting ? "default" : "pointer",
+                  opacity: collectionImporting ? 0.6 : 1, _hover: { opacity: 0.9 },
+                } as any)}
+              >
+                {collectionImporting ? "Importing..." : `Import ${collectionPreview.documents.length} Documents`}
+              </button>
+            </div>
+          )}
+        </section>
+
+        {/* ZIM Import */}
+        <section className={css({ marginBottom: "2xl" })}>
+          <h2 className={css({ fontSize: "md", fontWeight: 600, color: "text.primary", marginBottom: "xs" })}>
+            Import ZIM Archive
+          </h2>
+          <p className={css({ fontSize: "sm", color: "text.muted", marginBottom: "md", lineHeight: 1.5 })}>
+            Import articles from a Kiwix ZIM file (offline Wikipedia, reference materials, etc.).
+            Download ZIM files from <span className={css({ color: "accent.base" })}>download.kiwix.org</span>.
+          </p>
+          <div className={css({ display: "flex", gap: "sm", alignItems: "center", marginBottom: "sm" })}>
+            <input
+              type="text"
+              value={zimPath}
+              onChange={(e) => setZimPath(e.target.value)}
+              placeholder="/path/to/wikipedia.zim"
+              className={css({
+                flex: 1, padding: "sm", paddingLeft: "md",
+                bg: "bg.surface", border: "1px solid", borderColor: "border.base",
+                borderRadius: "md", color: "text.primary", fontSize: "sm",
+                outline: "none", _focus: { borderColor: "accent.base" },
+              } as any)}
+            />
+            <input
+              type="number"
+              value={zimCount}
+              onChange={(e) => setZimCount(e.target.value)}
+              className={css({
+                width: "80px", padding: "sm", textAlign: "center",
+                bg: "bg.surface", border: "1px solid", borderColor: "border.base",
+                borderRadius: "md", color: "text.primary", fontSize: "sm",
+                outline: "none",
+              } as any)}
+            />
+            <button
+              onClick={async () => {
+                if (!zimPath.trim()) return;
+                setZimLoading(true);
+                setZimError(null);
+                try {
+                  const results = await importZimArticles(zimPath.trim(), parseInt(zimCount) || 50);
+                  setZimPath("");
+                  setZimError(null);
+                } catch (e) {
+                  setZimError(String(e));
+                }
+                setZimLoading(false);
+              }}
+              disabled={zimLoading || !zimPath.trim()}
+              className={css({
+                padding: "sm", paddingLeft: "md", paddingRight: "md",
+                bg: "accent.base", color: "white", borderRadius: "md",
+                fontSize: "sm", fontWeight: 500, cursor: "pointer",
+                opacity: zimLoading || !zimPath.trim() ? 0.5 : 1,
+                _hover: { opacity: 0.9 },
+              } as any)}
+            >
+              {zimLoading ? "Importing..." : "Import"}
+            </button>
+          </div>
+          <div className={css({ fontSize: "xs", color: "text.muted" })}>
+            Max articles to import (default 50)
+          </div>
+          {zimError && (
+            <p className={css({ fontSize: "xs", color: "#f87171", marginTop: "sm" })}>{zimError}</p>
           )}
         </section>
 
